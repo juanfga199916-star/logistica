@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from streamlit_folium import st_folium
 import folium
+from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
@@ -11,16 +12,29 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- INICIALIZACIÓN DEL ESTADO DE LA SESIÓN ---
-# 'session_state' es la memoria de Streamlit. Lo usamos para guardar los puntos
-# que el usuario agrega en el mapa, para que no se borren.
+# --- INICIALIZACIÓN DEL ESTADO ---
+# Usamos st.session_state para guardar los puntos y la ubicación del mapa
 if 'puntos' not in st.session_state:
     st.session_state.puntos = []
+if 'map_center' not in st.session_state:
+    # Coordenadas iniciales (Bogotá)
+    st.session_state.map_center = [4.60971, -74.08175]
 
 # --- FUNCIONES DE LÓGICA ---
 
+def get_coords_from_city(city_name):
+    """Obtiene las coordenadas (lat, lon) de una ciudad usando geopy."""
+    try:
+        geolocator = Nominatim(user_agent="routing_app")
+        location = geolocator.geocode(city_name)
+        if location:
+            return [location.latitude, location.longitude]
+    except Exception as e:
+        st.error(f"No se pudo encontrar la ciudad. Error: {e}")
+    return None
+
 def simular_metricas_ruta(num_puntos):
-    """Simula métricas de la ruta basadas en el número de entregas."""
+    """Simula las métricas de la ruta."""
     if num_puntos == 0:
         return {"distancia": "0.00 km", "tiempo": "0 min"}
     
@@ -35,25 +49,18 @@ def simular_metricas_ruta(num_puntos):
     }
 
 def crear_tabla_de_pedidos(puntos):
-    """Crea un DataFrame con los detalles de los puntos de entrega seleccionados."""
+    """Crea un DataFrame con los detalles de los pedidos."""
     if not puntos:
         return pd.DataFrame(columns=['ID Pedido', 'Destino', 'Prioridad', 'Latitud', 'Longitud'])
     
-    # Extraemos los datos de la lista de diccionarios en el session_state
-    ids = [f"Pedido {i+1}" for i in range(len(puntos))]
-    destinos = [p.get('nombre', f'Punto {i+1}') for i, p in enumerate(puntos)]
-    prioridades = [p.get('prioridad', 'Media') for p in puntos]
-    latitudes = [p['lat'] for p in puntos]
-    longitudes = [p['lon'] for p in puntos]
-
-    df_pedidos = pd.DataFrame({
-        'ID Pedido': ids,
-        'Destino': destinos,
-        'Prioridad': prioridades,
-        'Latitud': latitudes,
-        'Longitud': longitudes
-    })
-    return df_pedidos
+    data = {
+        'ID Pedido': [f"Pedido {i+1}" for i in range(len(puntos))],
+        'Destino': [p.get('nombre', f'Punto {i+1}') for i, p in enumerate(puntos)],
+        'Prioridad': [p.get('prioridad', 'Media') for p in puntos],
+        'Latitud': [p['lat'] for p in puntos],
+        'Longitud': [p['lon'] for p in puntos]
+    }
+    return pd.DataFrame(data)
 
 # --- INTERFAZ DE USUARIO ---
 
@@ -65,51 +72,62 @@ st.write(
 # --- BARRA LATERAL (CONTROLES) ---
 with st.sidebar:
     st.header("⚙️ Configuración de la Ruta")
-    punto_inicio = st.text_input("📍 Punto de Inicio", "Almacén Central")
+    
+    # 1. CASILLA PARA UBICAR EL MAPA EN UNA CIUDAD
+    ciudad = st.text_input("📍 Tu ciudad de operación", "Bogotá")
+    if st.button("Buscar Ciudad"):
+        new_coords = get_coords_from_city(ciudad)
+        if new_coords:
+            st.session_state.map_center = new_coords
+            st.success(f"Mapa centrado en {ciudad}.")
 
+    st.divider()
+
+    # 2. GESTIÓN DE PEDIDOS Y PRIORIDADES
     st.subheader("Pedidos y Prioridades")
     st.caption("Los puntos agregados en el mapa aparecerán aquí.")
 
-    # Iteramos sobre cada punto guardado en el estado para mostrar sus opciones
+    # El número de pedidos se define por la cantidad de puntos en st.session_state
+    # Mostramos los campos para cada punto agregado
     for i, punto in enumerate(st.session_state.puntos):
-        st.markdown(f"**Punto {i+1}**")
-        # Creamos campos para que el usuario asigne nombre y prioridad a cada punto
-        punto['nombre'] = st.text_input(f"Nombre del Destino {i+1}", value=punto.get('nombre', f'Punto {i+1}'), key=f"nombre_{i}")
-        punto['prioridad'] = st.selectbox("Prioridad", ['Alta', 'Media', 'Baja'], index=1, key=f"prioridad_{i}")
+        st.markdown(f"**Punto de Entrega {i+1}**")
+        punto['nombre'] = st.text_input(f"Nombre del Destino", value=punto.get('nombre', f'Punto {i+1}'), key=f"nombre_{i}")
+        # 3. CASILLA DE PRIORIDAD CON 4 NIVELES
+        punto['prioridad'] = st.selectbox(
+            "Prioridad",
+            ('Baja', 'Media', 'Alta', 'Muy Alta'), 
+            index=1, 
+            key=f"prioridad_{i}"
+        )
 
-    # Botón para limpiar todos los puntos agregados
     if st.button("🗑️ Limpiar todos los puntos"):
         st.session_state.puntos = []
-        st.rerun() # Volvemos a ejecutar el script para refrescar la UI
+        st.rerun()
 
-# --- MAPA INTERACTIVO Y LÓGICA PRINCIPAL ---
+# --- CONTENIDO PRINCIPAL ---
 col1, col2 = st.columns((2, 1))
 
 with col1:
     st.subheader("Selecciona los Puntos de Entrega")
     
-    # Creamos un mapa centrado en Bogotá
-    m = folium.Map(location=[4.60971, -74.08175], zoom_start=12)
+    # El mapa se crea usando las coordenadas guardadas en el estado
+    m = folium.Map(location=st.session_state.map_center, zoom_start=13)
 
-    # Añadimos los marcadores de los puntos ya existentes al mapa
     for i, punto in enumerate(st.session_state.puntos):
         folium.Marker(
             [punto['lat'], punto['lon']], 
-            popup=f"Punto {i+1}",
-            tooltip=f"Destino: {punto.get('nombre', i+1)}"
+            popup=f"Destino: {punto.get('nombre', i+1)}\nPrioridad: {punto.get('prioridad', 'Media')}",
+            tooltip=f"Punto {i+1}"
         ).add_to(m)
+    
+    # 4. MAPA DONDE SE AGREGAN PEDIDOS MANUALMENTE
+    map_data = st_folium(m, width='100%', height=500)
 
-    # Usamos st_folium para renderizar el mapa y capturar clics
-    map_data = st_folium(m, width='100%')
-
-    # Si el usuario hace clic en el mapa, 'map_data' contendrá la información
+    # Lógica para agregar un nuevo punto al hacer clic
     if map_data and map_data.get("last_clicked"):
         lat = map_data["last_clicked"]["lat"]
         lon = map_data["last_clicked"]["lng"]
-        
-        # Guardamos el nuevo punto en nuestra lista de 'session_state'
         st.session_state.puntos.append({"lat": lat, "lon": lon})
-        # Forzamos un 'rerun' para que la barra lateral se actualice instantáneamente
         st.rerun()
 
 with col2:
@@ -118,11 +136,11 @@ with col2:
     num_pedidos = len(st.session_state.puntos)
     metricas = simular_metricas_ruta(num_pedidos)
     
+    # El número de pedidos se muestra aquí automáticamente
     st.metric(label="Pedidos Totales", value=num_pedidos)
     st.metric(label="Distancia Total Estimada", value=metricas["distancia"])
     st.metric(label="Tiempo Estimado de Viaje", value=metricas["tiempo"])
 
 st.subheader("📄 Detalles de los Pedidos")
-# Creamos y mostramos la tabla de pedidos a partir de los puntos seleccionados
 df_pedidos = crear_tabla_de_pedidos(st.session_state.puntos)
-st.dataframe(df_pedidos)
+st.dataframe(df_pedidos, use_container_width=True)
