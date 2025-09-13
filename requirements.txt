@@ -4,3 +4,4 @@ numpy
 pytest
 streamlit-folium
 geopy
+openrouteservice
