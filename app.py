@@ -25,7 +25,7 @@ if 'seleccionando_centro' not in st.session_state:
     st.session_state.seleccionando_centro = False
 
 # --- CONFIGURAR OPENROUTESERVICE ---
-ORS_API_KEY = "TU_API_KEY_AQUI"  # 👈 Pega aquí tu API Key de ORS
+ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImY5MTA5MmE2NzVmZDRhYjBhMTk4YjZiNWNiMWY2YjQzIiwiaCI6Im11cm11cjY0In0="  # 👈 Pega aquí tu API Key de ORS
 client = openrouteservice.Client(key=ORS_API_KEY)
 
 # --- FUNCIONES DE LÓGICA ---
