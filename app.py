@@ -13,12 +13,14 @@ st.set_page_config(
 )
 
 # --- INICIALIZACIÓN DEL ESTADO ---
-# Usamos st.session_state para guardar los puntos y la ubicación del mapa
 if 'puntos' not in st.session_state:
     st.session_state.puntos = []
 if 'map_center' not in st.session_state:
-    # Coordenadas iniciales (Bogotá)
-    st.session_state.map_center = [4.60971, -74.08175]
+    st.session_state.map_center = [4.60971, -74.08175]  # Bogotá
+if 'centro' not in st.session_state:
+    st.session_state.centro = None
+if 'seleccionando_centro' not in st.session_state:
+    st.session_state.seleccionando_centro = False
 
 # --- FUNCIONES DE LÓGICA ---
 
@@ -66,14 +68,15 @@ def crear_tabla_de_pedidos(puntos):
 
 st.title("🗺️ Panel de Control para Optimización de Rutas")
 st.write(
-    "Herramienta interactiva para planificar rutas. **Haz clic en el mapa para agregar los puntos de entrega** y configúralos en la barra lateral."
+    "Herramienta interactiva para planificar rutas. **Haz clic en el mapa para agregar los puntos de entrega** "
+    "y configúralos en la barra lateral."
 )
 
-# --- BARRA LATERAL (CONTROLES) ---
+# --- BARRA LATERAL ---
 with st.sidebar:
     st.header("⚙️ Configuración de la Ruta")
     
-    # 1. CASILLA PARA UBICAR EL MAPA EN UNA CIUDAD
+    # Ubicar mapa en ciudad
     ciudad = st.text_input("📍 Tu ciudad de operación", "Bogotá")
     if st.button("Buscar Ciudad"):
         new_coords = get_coords_from_city(ciudad)
@@ -83,20 +86,27 @@ with st.sidebar:
 
     st.divider()
 
-    # 2. GESTIÓN DE PEDIDOS Y PRIORIDADES
+    # Punto central
+    st.subheader("Centro de Distribución")
+    if st.button("📍 Seleccionar Centro en el Mapa"):
+        st.session_state.seleccionando_centro = True
+        st.info("Haz clic en el mapa para definir el centro.")
+
+    st.divider()
+
+    # Pedidos
     st.subheader("Pedidos y Prioridades")
     st.caption("Los puntos agregados en el mapa aparecerán aquí.")
 
-    # El número de pedidos se define por la cantidad de puntos en st.session_state
-    # Mostramos los campos para cada punto agregado
     for i, punto in enumerate(st.session_state.puntos):
         st.markdown(f"**Punto de Entrega {i+1}**")
-        punto['nombre'] = st.text_input(f"Nombre del Destino", value=punto.get('nombre', f'Punto {i+1}'), key=f"nombre_{i}")
-        # 3. CASILLA DE PRIORIDAD CON 4 NIVELES
+        punto['nombre'] = st.text_input(f"Nombre del Destino", 
+                                        value=punto.get('nombre', f'Punto {i+1}'), 
+                                        key=f"nombre_{i}")
         punto['prioridad'] = st.selectbox(
             "Prioridad",
-            ('Baja', 'Media', 'Alta', 'Muy Alta'), 
-            index=1, 
+            ('Baja', 'Media', 'Alta', 'Muy Alta'),
+            index=1,
             key=f"prioridad_{i}"
         )
 
@@ -108,35 +118,52 @@ with st.sidebar:
 col1, col2 = st.columns((2, 1))
 
 with col1:
-    st.subheader("Selecciona los Puntos de Entrega")
-    
-    # El mapa se crea usando las coordenadas guardadas en el estado
+    st.subheader("Mapa de la Ruta")
     m = folium.Map(location=st.session_state.map_center, zoom_start=13)
 
+    # Marcar centro
+    if st.session_state.centro:
+        folium.Marker(
+            st.session_state.centro,
+            icon=folium.Icon(color="red", icon="home"),
+            popup="Centro de Distribución"
+        ).add_to(m)
+
+    # Marcar pedidos
     for i, punto in enumerate(st.session_state.puntos):
         folium.Marker(
             [punto['lat'], punto['lon']], 
             popup=f"Destino: {punto.get('nombre', i+1)}\nPrioridad: {punto.get('prioridad', 'Media')}",
             tooltip=f"Punto {i+1}"
         ).add_to(m)
-    
-    # 4. MAPA DONDE SE AGREGAN PEDIDOS MANUALMENTE
+
+    # Dibujar rutas como líneas rectas
+    if st.session_state.centro:
+        for punto in st.session_state.puntos:
+            folium.PolyLine(
+                [st.session_state.centro, [punto['lat'], punto['lon']]],
+                color="blue",
+                weight=2,
+                opacity=0.7
+            ).add_to(m)
+
+    # Capturar clics
     map_data = st_folium(m, width='100%', height=500)
 
-    # Lógica para agregar un nuevo punto al hacer clic
     if map_data and map_data.get("last_clicked"):
-        lat = map_data["last_clicked"]["lat"]
-        lon = map_data["last_clicked"]["lng"]
-        st.session_state.puntos.append({"lat": lat, "lon": lon})
-        st.rerun()
+        lat, lon = map_data["last_clicked"]["lat"], map_data["last_clicked"]["lng"]
+        if st.session_state.seleccionando_centro:
+            st.session_state.centro = [lat, lon]
+            st.session_state.seleccionando_centro = False
+            st.rerun()
+        else:
+            st.session_state.puntos.append({"lat": lat, "lon": lon})
+            st.rerun()
 
 with col2:
     st.subheader("Estadísticas Clave")
-    
     num_pedidos = len(st.session_state.puntos)
     metricas = simular_metricas_ruta(num_pedidos)
-    
-    # El número de pedidos se muestra aquí automáticamente
     st.metric(label="Pedidos Totales", value=num_pedidos)
     st.metric(label="Distancia Total Estimada", value=metricas["distancia"])
     st.metric(label="Tiempo Estimado de Viaje", value=metricas["tiempo"])
