@@ -1,59 +1,46 @@
 import pytest
 import pandas as pd
-from app import generar_puntos_de_entrega # Importamos la función a probar
+from app import crear_tabla_de_pedidos, simular_metricas_ruta
 
-# --- Caso 1: Prueba con una entrada válida ---
-def test_generar_puntos_de_entrega_caso_valido():
+# --- Prueba para la nueva lógica de la tabla de pedidos ---
+def test_crear_tabla_de_pedidos_con_datos():
     """
-    Verifica que la función genere correctamente un DataFrame con un número
-    positivo de puntos.
+    Verifica que la tabla se cree correctamente a partir de una lista de puntos.
     """
-    # 1. PREPARACIÓN (Arrange)
-    num_puntos = 5
-    
-    # 2. ACCIÓN (Act)
-    resultado = generar_puntos_de_entrega(num_puntos)
-    
-    # 3. VERIFICACIÓN (Assert)
-    # Comprueba que el resultado es un DataFrame de pandas
-    assert isinstance(resultado, pd.DataFrame), "El resultado debe ser un DataFrame de pandas."
-    
-    # Comprueba que el DataFrame tiene el número correcto de filas
-    assert len(resultado) == num_puntos, f"El DataFrame debería tener {num_puntos} filas."
-    
-    # Comprueba que las columnas necesarias ('lat', 'lon') existen
-    assert 'lat' in resultado.columns, "La columna 'lat' debe existir."
-    assert 'lon' in resultado.columns, "La columna 'lon' debe existir."
+    # 1. PREPARACIÓN: Creamos una lista de puntos similar a la de st.session_state
+    puntos_de_prueba = [
+        {"lat": 4.6, "lon": -74.0, "nombre": "Cliente A", "prioridad": "Alta"},
+        {"lat": 4.7, "lon": -74.1, "nombre": "Cliente B", "prioridad": "Baja"}
+    ]
 
+    # 2. ACCIÓN
+    df_resultado = crear_tabla_de_pedidos(puntos_de_prueba)
 
-# --- Caso 2: Prueba con una entrada que debe generar un error (caso límite) ---
-def test_generar_puntos_de_entrega_caso_invalido_negativo():
-    """
-    Verifica que la función levante un error (ValueError) si se le pasa
-    un número negativo, ya que no se pueden generar -1 puntos.
-    """
-    # 1. PREPARACIÓN (Arrange)
-    num_puntos_invalidos = -1
-    
-    # 2. ACCIÓN y VERIFICACIÓN (Act & Assert)
-    # Usamos pytest.raises para verificar que se produce un error específico.
-    # El bloque de código dentro de 'with' debe levantar un ValueError para que
-    # la prueba pase.
-    with pytest.raises(ValueError):
-        generar_puntos_de_entrega(num_puntos_invalidos)
+    # 3. VERIFICACIÓN
+    assert isinstance(df_resultado, pd.DataFrame)
+    assert len(df_resultado) == 2
+    assert df_resultado.iloc[0]['Destino'] == "Cliente A"
+    assert df_resultado.iloc[1]['Prioridad'] == "Baja"
+    assert 'Latitud' in df_resultado.columns
 
-# --- (Opcional) Otro caso límite muy útil ---
-def test_generar_puntos_de_entrega_caso_cero():
+def test_crear_tabla_de_pedidos_vacia():
     """
-    Verifica que la función maneja correctamente el caso de 0 puntos,
-    devolviendo un DataFrame vacío.
+    Verifica que la función devuelva un DataFrame vacío si no hay puntos.
     """
-    # 1. PREPARACIÓN (Arrange)
-    num_puntos = 0
-    
-    # 2. ACCIÓN (Act)
-    resultado = generar_puntos_de_entrega(num_puntos)
-    
-    # 3. VERIFICACIÓN (Assert)
-    assert isinstance(resultado, pd.DataFrame), "El resultado debe ser un DataFrame."
-    assert len(resultado) == num_puntos, "El DataFrame debería estar vacío (0 filas)."
+    # 1. PREPARACIÓN
+    puntos_vacios = []
+
+    # 2. ACCIÓN
+    df_resultado = crear_tabla_de_pedidos(puntos_vacios)
+
+    # 3. VERIFICACIÓN
+    assert isinstance(df_resultado, pd.DataFrame)
+    assert len(df_resultado) == 0
+
+def test_simular_metricas_ruta_cero_puntos():
+    """
+    Verifica que las métricas sean cero si no hay puntos.
+    """
+    metricas = simular_metricas_ruta(0)
+    assert metricas["distancia"] == "0.00 km"
+    assert metricas["tiempo"] == "0 min"
