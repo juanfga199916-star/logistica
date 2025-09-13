@@ -1,3 +1,7 @@
+# Librerías para la aplicación
 streamlit
 pandas
 numpy
+
+# Librería para las pruebas
+pytest
