@@ -4,6 +4,8 @@ import numpy as np
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
+import openrouteservice
+from openrouteservice import convert
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(
@@ -21,6 +23,10 @@ if 'centro' not in st.session_state:
     st.session_state.centro = None
 if 'seleccionando_centro' not in st.session_state:
     st.session_state.seleccionando_centro = False
+
+# --- CONFIGURAR OPENROUTESERVICE ---
+ORS_API_KEY = "TU_API_KEY_AQUI"  # 👈 Pega aquí tu API Key de ORS
+client = openrouteservice.Client(key=ORS_API_KEY)
 
 # --- FUNCIONES DE LÓGICA ---
 
@@ -63,6 +69,29 @@ def crear_tabla_de_pedidos(puntos):
         'Longitud': [p['lon'] for p in puntos]
     }
     return pd.DataFrame(data)
+
+def trazar_ruta_callejero(centro, puntos):
+    """Calcula la ruta real pasando primero por prioridades."""
+    if not centro or not puntos:
+        return None
+
+    # Ordenar puntos por prioridad
+    prioridad_ranking = {"Muy Alta": 1, "Alta": 2, "Media": 3, "Baja": 4}
+    puntos_ordenados = sorted(
+        puntos, 
+        key=lambda p: prioridad_ranking.get(p.get("prioridad", "Media"))
+    )
+
+    # Crear lista de coordenadas [lon, lat] para ORS
+    coords = [[centro[1], centro[0]]] + [[p['lon'], p['lat']] for p in puntos_ordenados]
+
+    try:
+        # Llamar a ORS para calcular la ruta
+        route = client.directions(coords, profile='driving-car', format='geojson')
+        return route
+    except Exception as e:
+        st.error(f"Error al calcular la ruta: {e}")
+        return None
 
 # --- INTERFAZ DE USUARIO ---
 
@@ -137,14 +166,14 @@ with col1:
             tooltip=f"Punto {i+1}"
         ).add_to(m)
 
-    # Dibujar rutas como líneas rectas
-    if st.session_state.centro:
-        for punto in st.session_state.puntos:
-            folium.PolyLine(
-                [st.session_state.centro, [punto['lat'], punto['lon']]],
-                color="blue",
-                weight=2,
-                opacity=0.7
+    # Dibujar ruta real si hay centro y pedidos
+    if st.session_state.centro and st.session_state.puntos:
+        route = trazar_ruta_callejero(st.session_state.centro, st.session_state.puntos)
+        if route:
+            folium.GeoJson(
+                route,
+                name="Ruta óptima",
+                style_function=lambda x: {"color": "blue", "weight": 4, "opacity": 0.8}
             ).add_to(m)
 
     # Capturar clics
