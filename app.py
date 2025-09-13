@@ -32,7 +32,7 @@ if 'last_fingerprint' not in st.session_state:
     st.session_state.last_fingerprint = None
 
 # --- CONFIGURAR ORS ---
-ORS_API_KEY = "TU_API_KEY_AQUI"
+ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImY5MTA5MmE2NzVmZDRhYjBhMTk4YjZiNWNiMWY2YjQzIiwiaCI6Im11cm11cjY0In0="
 client = openrouteservice.Client(key=ORS_API_KEY)
 
 # --- HELPERS ---
