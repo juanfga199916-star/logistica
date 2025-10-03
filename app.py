@@ -387,15 +387,24 @@ with st.sidebar:
                 st.info("La ruta ya está calculada y actualizada.")
             else:
                 with st.spinner("Resolviendo VRPTW (OR-Tools)..."):
-                    result = solve_vrptw_depot_first(st.session_state.centro, st.session_state.puntos, fleet_cfg, avg_speed_kmph)
-                    if result is None:
-                        st.error("No se obtuvo solución del solver.")
+                    result = solve_vrptw_depot_first(
+                        st.session_state.centro,
+                        st.session_state.puntos,
+                        fleet_cfg,
+                        avg_speed_kmph
+                    )
+
+                    # Validar que haya solución
+                    if not result or result[0] is None or result[1] is None:
+                        st.error("No se obtuvo una solución factible. Intenta relajar las ventanas horarias, aumentar vehículos o capacidad.")
                     else:
                         routes_idx, coords_per_route, metrics_est = result
-                        # Para cada route coords_per_route, solicitar ORS para polylines (si disponible)
+
+                        # Para cada ruta devuelta, pedimos ORS o usamos fallback
                         combined_features = []
                         total_distance_m = 0
                         total_duration_s = 0
+                    
                         for seq in coords_per_route:
                             if not seq:
                                 continue
