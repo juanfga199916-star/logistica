@@ -66,7 +66,7 @@ class DataManager:
                 pass
 
         # Procesar Flota
-        fleet_list = []
+        fleet_list: List[Dict[str, Any]] = []
         if idx_flota != -1:
             # Iteramos desde la fila de flota hasta encontrar una vacía o el inicio de pedidos
             start_row = idx_flota + 1
@@ -114,7 +114,7 @@ class DataManager:
         geolocator = Nominatim(user_agent="route_optimizer_app_v1")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         
-        processed_points = []
+        processed_points: List[Dict[str, Any]] = []
         
         # Bucle de procesamiento de pedidos
         for idx, row in df.iterrows():
@@ -260,11 +260,11 @@ class RoutingEngine:
             return None
 
         # 5. Extraer Rutas
-        final_routes = []
+        final_routes: List[Dict[str, Any]] = []
         for vehicle_id in range(len(flota)):
             index = routing.Start(vehicle_id)
-            route_coords = []
-            route_nodes = []
+            route_coords: List[List[float]] = []
+            route_nodes: List[int] = []
             total_dist = 0
             
             while not routing.IsEnd(index):
