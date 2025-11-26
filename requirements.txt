@@ -1,10 +1,12 @@
 streamlit
 pandas
 numpy
-pytest
+folium
 streamlit-folium
 geopy
 openrouteservice
-folium
 ortools
 openpyxl
+requests
+protobuf
+python-dotenv
