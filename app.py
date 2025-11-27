@@ -31,8 +31,26 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
     return 6371 * 2 * asin(sqrt(a))
 
+def format_time_series(series, default_time):
+    """Convierte todos los valores de una serie a un string 'HH:MM' de forma segura."""
+    series = series.fillna(default_time).copy()
+    
+    def safe_format(val):
+        if isinstance(val, str) and len(val) == 5 and val.count(':') == 1:
+            return val
+        try:
+            dt = pd.to_datetime(val, errors='coerce')
+            if pd.notna(dt):
+                return dt.strftime('%H:%M')
+        except:
+            pass 
+            
+        return default_time
+
+    return series.apply(safe_format)
+
 def time_str_to_minutes(t):
-    """Convierte un objeto de tiempo o una cadena de texto (HH:MM o HH:MM:SS) a minutos desde la medianoche."""
+    """Convierte un objeto de tiempo o una cadena de texto a minutos desde la medianoche."""
     
     if isinstance(t, pd.Timestamp):
         t = t.time()
@@ -63,7 +81,7 @@ def solve_vrptw(centro, puntos, df_flota):
     
     if df_flota.empty: return None, None
     
-    # Los valores aquí serán cadenas de texto 'HH:MM' gracias al preprocesamiento
+    # Asumimos que la primera fila define el horario del depósito
     depot_start_time = df_flota.iloc[0]['turno_inicio']
     depot_end_time = df_flota.iloc[0]['turno_fin']
     
@@ -120,7 +138,6 @@ def solve_vrptw(centro, puntos, df_flota):
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
     
     # Dimensión de Tiempo
-    # Máximo tiempo del turno + 60 minutos de holgura
     max_time = int(time_str_to_minutes(depot_end_time) + 60)
     routing.AddDimension(transit_idx, max_time, max_time, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
@@ -131,9 +148,8 @@ def solve_vrptw(centro, puntos, df_flota):
         start = time_str_to_minutes(nodes[node_idx]['tw_start'])
         end = time_str_to_minutes(nodes[node_idx]['tw_end'])
         
-        # Validar rangos: Asegurar que END es estrictamente mayor que START
+        # Validación de rangos
         if start >= end:
-            # Forzar una ventana mínima válida (1 hora)
             end = start + 60 
             
         time_dim.CumulVar(idx).SetRange(start, end)
@@ -207,7 +223,7 @@ col1, col2 = st.columns((3, 1))
 
 with st.sidebar:
     st.header("📂 1. Cargar Datos")
-    st.info("Sube un Excel con hojas: 'pedidos' y 'flota'. Las rutas se calcularán automáticamente.")
+    st.info("Sube el archivo **Excel (.xlsx)** con hojas 'pedidos' y 'flota'. Las rutas se calcularán automáticamente.")
     file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
     
     if file:
@@ -220,7 +236,7 @@ with st.sidebar:
                 df_pedidos_loaded = pd.read_excel(file, sheet_name=pedidos_sheet)
                 df_flota_loaded = pd.read_excel(file, sheet_name=flota_sheet)
                 
-                # Preprocesamiento de PEDIDOS
+                # --- Preprocesamiento de PEDIDOS ---
                 df_pedidos_loaded.columns = df_pedidos_loaded.columns.str.strip() 
                 df_pedidos_loaded = df_pedidos_loaded.rename(columns={
                     'Latitud': 'lat', 'Longitud': 'lon', 'Peso (kg)': 'peso', 'Vol (m³)': 'vol',
@@ -229,47 +245,53 @@ with st.sidebar:
                 if 'nombre_pedido' not in df_pedidos_loaded.columns:
                     df_pedidos_loaded['nombre_pedido'] = 'Pedido ' + df_pedidos_loaded.index.astype(str)
 
-                # Corrección de escala de coordenadas (se mantiene)
+                # CORRECCIÓN DE ESCALA: Se mantiene el ajuste por el formato de las coordenadas
                 if 'lat' in df_pedidos_loaded.columns and df_pedidos_loaded['lat'].mean() > 15:
                     df_pedidos_loaded['lat'] = df_pedidos_loaded['lat'] / 10
                     df_pedidos_loaded['lon'] = df_pedidos_loaded['lon'] / 10
                     st.warning("⚠️ Coordenadas corregidas (división por 10).")
                 
-                # --- CORRECCIÓN CRÍTICA: Relleno y Estandarización de TIEMPOS DE PEDIDOS ---
-                df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00'])).fillna('07:00')
-                df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00'])).fillna('19:00')
-
-                # Forzar formato HH:MM (Solución al error SetRange)
-                try:
-                    df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded['Tw_Start'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
-                    df_pedidos_loaded['Tw_End'] = df_pedidos_loaded['Tw_End'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
-                except:
-                    st.warning("No se pudieron estandarizar los tiempos a HH:MM. El cálculo podría fallar si el formato es inconsistente.")
+                # LIMPIEZA DE TIEMPOS DE PEDIDOS (Usando las columnas Tw_Start/Tw_End del Excel)
+                df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00']))
+                df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00']))
+                df_pedidos_loaded['Tw_Start'] = format_time_series(df_pedidos_loaded['Tw_Start'], '07:00')
+                df_pedidos_loaded['Tw_End'] = format_time_series(df_pedidos_loaded['Tw_End'], '19:00')
 
 
-                # Preprocesamiento de FLOTA
+                # --- Preprocesamiento de FLOTA ---
                 df_flota_loaded.columns = df_flota_loaded.columns.str.strip().str.lower()
                 df_flota_loaded['cantidad'] = df_flota_loaded['cantidad'].fillna(0).astype(int)
                 df_flota_loaded['capacidad_kg'] = df_flota_loaded['capacidad_kg'].fillna(0).astype(float)
                 df_flota_loaded['velocidad_kmh'] = df_flota_loaded['velocidad_kmh'].fillna(40).astype(float)
                 
-                # --- CORRECCIÓN CRÍTICA: Relleno y Estandarización de TIEMPOS DE FLOTA ---
-                df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(['07:00'])).fillna('07:00')
-                df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(['19:00'])).fillna('19:00')
-                
-                # Forzar formato HH:MM (Solución al error SetRange)
-                try:
-                    df_flota_loaded['turno_inicio'] = df_flota_loaded['turno_inicio'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
-                    df_flota_loaded['turno_fin'] = df_flota_loaded['turno_fin'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
-                except:
-                    pass
+                # --- CORRECCIÓN CRÍTICA: Lógica para columna 'turno' (duración) ---
+                df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(dtype='object'))
+                df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(dtype='object'))
+
+                if 'turno' in df_flota_loaded.columns and df_flota_loaded['turno_inicio'].isnull().all():
+                    st.info("⚠️ Usando la columna 'turno' (horas) para calcular la ventana de tiempo de los vehículos (Inicio 07:00).")
+                    df_flota_loaded['turno'] = df_flota_loaded['turno'].fillna(8).astype(int)
+                    df_flota_loaded['turno_inicio'] = '07:00'
+                    
+                    def calculate_end_time(duration_hours):
+                        start_time = datetime.datetime.strptime('07:00', '%H:%M')
+                        end_time = start_time + datetime.timedelta(hours=int(duration_hours))
+                        return end_time.strftime('%H:%M')
+                        
+                    df_flota_loaded['turno_fin'] = df_flota_loaded['turno'].apply(calculate_end_time)
+
+                # Aplicar default y formateo estricto
+                df_flota_loaded['turno_inicio'] = df_flota_loaded['turno_inicio'].fillna('07:00')
+                df_flota_loaded['turno_fin'] = df_flota_loaded['turno_fin'].fillna('19:00')
+                df_flota_loaded['turno_inicio'] = format_time_series(df_flota_loaded['turno_inicio'], '07:00')
+                df_flota_loaded['turno_fin'] = format_time_series(df_flota_loaded['turno_fin'], '19:00')
+
 
                 # Guardar en estado de sesión
                 st.session_state.df_pedidos = df_pedidos_loaded
                 st.session_state.df_flota = df_flota_loaded
                 st.session_state.puntos = st.session_state.df_pedidos.to_dict('records')
                 
-                # Reiniciar métricas para forzar el auto-cálculo
                 st.session_state.route_metrics = None 
                 st.success("✅ Datos cargados. Calculando rutas automáticamente...")
 
@@ -277,7 +299,7 @@ with st.sidebar:
                 st.error("El Excel debe tener hojas llamadas 'pedidos' y 'flota'.")
         
         except Exception as e:
-            st.error(f"Error procesando el archivo: {e}")
+            st.error(f"Error procesando el archivo. Asegúrese que las coordenadas y pesos son numéricos: {e}")
             
     # --- 2. Ingreso Manual del CEDIS ---
     st.divider()
@@ -335,7 +357,6 @@ with col2:
     # --- LÓGICA DE AUTO-CÁLCULO ---
     if st.session_state.df_pedidos is not None and st.session_state.df_flota is not None:
         
-        # 1. Recalculo si la ruta no ha sido calculada O si la ubicación del CEDIS ha cambiado
         cedis_changed = (st.session_state.cedis['lat'] != st.session_state.last_calculated_cedis['lat'] or
                          st.session_state.cedis['lon'] != st.session_state.last_calculated_cedis['lon'])
 
@@ -351,7 +372,6 @@ with col2:
                     'rutas_info': rutas_info,
                     'vehiculos_usados': metricas['vehiculos_usados']
                 }
-                # Guardar el CEDIS calculado para detectar futuros cambios
                 st.session_state['last_calculated_cedis'] = st.session_state.cedis.copy()
                 st.success(f"Cálculo finalizado. {len(rutas_info)} vehículos utilizados.")
                 st.balloons()
@@ -359,7 +379,6 @@ with col2:
                 st.session_state.route_metrics = None
                 st.error("No se encontró solución factible. Revisa la flota o las ventanas de tiempo.")
 
-        # 2. Si solo cambia el costo, actualizamos el costo
         elif st.session_state.route_metrics and st.session_state.route_metrics['costo_por_km'] != costo_por_km:
             st.session_state.route_metrics['costo_por_km'] = costo_por_km
             st.info("Costo operacional actualizado automáticamente.") 
@@ -380,7 +399,16 @@ with col2:
         df_usados = pd.Series(st.session_state.route_metrics['vehiculos_usados']).value_counts().reset_index()
         df_usados.columns = ['Tipo de Vehículo', 'Cantidad Utilizada']
         st.dataframe(df_usados, hide_index=True)
-
-    with st.expander("Ver Pedidos Cargados"):
-        if st.session_state.df_pedidos is not None:
-            st.dataframe(st.session_state.df_pedidos[['nombre_pedido', 'peso', 'lat', 'lon', 'Tw_Start', 'Tw_End']])
+        
+    st.divider()
+    
+    # --- TABLA DE PEDIDOS CARGADOS (Nueva ubicación) ---
+    st.subheader("📦 Pedidos Cargados")
+    if st.session_state.df_pedidos is not None:
+        st.dataframe(
+            st.session_state.df_pedidos[['nombre_pedido', 'peso', 'lat', 'lon', 'Tw_Start', 'Tw_End', 'Ciudad']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Cargue su archivo Excel para ver la lista de pedidos.")
