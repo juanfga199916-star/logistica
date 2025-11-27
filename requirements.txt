@@ -10,3 +10,6 @@ openpyxl
 requests
 protobuf
 python-dotenv
+
+
+
