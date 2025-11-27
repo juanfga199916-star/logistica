@@ -50,22 +50,22 @@ def format_time_series(series, default_time):
     return series.apply(safe_format)
 
 def time_str_to_minutes(t):
-    """Convierte un objeto de tiempo o una cadena de texto a minutos desde la medianoche."""
+    """Convierte un objeto de tiempo o una cadena de texto a minutos desde la medianoche, garantizando un int de Python."""
     
     if isinstance(t, pd.Timestamp):
         t = t.time()
         
     if isinstance(t, datetime.time):
-        return t.hour * 60 + t.minute
+        return int(t.hour * 60 + t.minute) # Conversión a int() nativo
         
     if isinstance(t, str):
         try:
             parts = t.split(':')
             h = int(parts[0])
             m = int(parts[1]) if len(parts) > 1 else 0
-            return h * 60 + m
+            return int(h * 60 + m) # Conversión a int() nativo
         except: 
-            return 420 # Default 7:00 AM
+            return 420 
     
     return 420
 
@@ -81,7 +81,6 @@ def solve_vrptw(centro, puntos, df_flota):
     
     if df_flota.empty: return None, None
     
-    # Asumimos que la primera fila define el horario del depósito
     depot_start_time = df_flota.iloc[0]['turno_inicio']
     depot_end_time = df_flota.iloc[0]['turno_fin']
     
@@ -144,9 +143,10 @@ def solve_vrptw(centro, puntos, df_flota):
     
     # Establecer rangos de tiempo (Time Windows)
     for node_idx in range(N):
+        # *** REFUERZO DE TIPO INT ANTES DE SetRange ***
+        start = int(time_str_to_minutes(nodes[node_idx]['tw_start']))
+        end = int(time_str_to_minutes(nodes[node_idx]['tw_end']))
         idx = manager.NodeToIndex(node_idx)
-        start = time_str_to_minutes(nodes[node_idx]['tw_start'])
-        end = time_str_to_minutes(nodes[node_idx]['tw_end'])
         
         # Validación de rangos
         if start >= end:
@@ -402,7 +402,7 @@ with col2:
         
     st.divider()
     
-    # --- TABLA DE PEDIDOS CARGADOS (Nueva ubicación) ---
+    # --- TABLA DE PEDIDOS CARGADOS ---
     st.subheader("📦 Pedidos Cargados")
     if st.session_state.df_pedidos is not None:
         st.dataframe(
