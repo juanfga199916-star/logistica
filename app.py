@@ -5,12 +5,12 @@ import folium
 from streamlit_folium import st_folium
 from math import radians, cos, sin, asin, sqrt
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+import datetime # Import necesario para manejar objetos de tiempo
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Panel de Control de Rutas", page_icon="🚚", layout="wide")
 
 # --- ESTADO INICIAL ---
-# Inicialización robusta de todas las variables de estado
 if 'puntos' not in st.session_state: st.session_state.puntos = []
 if 'map_center' not in st.session_state: st.session_state.map_center = [3.900, -76.300]
 if 'route_metrics' not in st.session_state: st.session_state.route_metrics = None
@@ -30,12 +30,24 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 6371 * 2 * asin(sqrt(a))
 
 def time_str_to_minutes(t):
-    """Convierte un string de tiempo (HH:MM) a minutos desde la medianoche."""
+    """Convierte un string, datetime.time o Timestamp a minutos desde la medianoche."""
+    
+    # 1. Manejar objetos de tiempo de Pandas/Python
+    if isinstance(t, pd.Timestamp):
+        t = t.time()
+        
+    if isinstance(t, datetime.time):
+        return t.hour * 60 + t.minute
+        
+    # 2. Manejar cadenas de texto (HH:MM)
     if isinstance(t, str):
         try:
             h, m = map(int, t.split(':'))
             return h*60 + m
-        except: return 420 # 7:00 AM
+        except: 
+            return 420 # 7:00 AM (420 min) como default
+    
+    # 3. Default (para NaN o tipos inesperados)
     return 420
 
 def solve_vrptw(centro, puntos, df_flota):
@@ -44,7 +56,7 @@ def solve_vrptw(centro, puntos, df_flota):
     OR-Tools asignará las rutas y los vehículos necesarios.
     """
     
-    # 1. Crear Pool de Vehículos (Lista de todos los vehículos individuales)
+    # 1. Crear Pool de Vehículos
     vehicle_pool = []
     vehicle_capacities = []
     vehicle_speeds = []
@@ -53,6 +65,7 @@ def solve_vrptw(centro, puntos, df_flota):
         st.error("La flota está vacía. No se puede calcular la ruta.")
         return None, None
     
+    # Los tiempos del depósito se asumen como los de la primera entrada de flota
     depot_start_time = df_flota.iloc[0]['turno_inicio']
     depot_end_time = df_flota.iloc[0]['turno_fin']
     
@@ -72,9 +85,7 @@ def solve_vrptw(centro, puntos, df_flota):
         st.error("No hay vehículos disponibles en la flota.")
         return None, None
     
-    # Usamos la velocidad promedio de la flota para calcular la matriz de tiempo
-    # (Simplificación para flotas heterogéneas, lo ideal es usar costos por vehículo)
-    avg_speed_km_min = np.mean(vehicle_speeds) / 60.0
+    avg_speed_km_min = np.mean(vehicle_speeds) / 60.0 if vehicle_speeds else 1.0 # Velocidad segura
     
     # 2. Crear Nodos
     nodes = [{'lat': centro['lat'], 'lon': centro['lon'], 'demand': 0, 'service': 0, 
@@ -82,7 +93,7 @@ def solve_vrptw(centro, puntos, df_flota):
     
     for p in puntos:
         nodes.append({
-            'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': 15, # Tiempo de servicio fijo
+            'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': 15,
             'tw_start': str(p.get('Tw_Start', '07:00')), 
             'tw_end': str(p.get('Tw_End', '19:00'))
         })
@@ -116,10 +127,18 @@ def solve_vrptw(centro, puntos, df_flota):
     routing.AddDimension(transit_idx, max_time, max_time, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
     
+    # Establecer rangos de tiempo
     for node_idx in range(N):
         idx = manager.NodeToIndex(node_idx)
         start = time_str_to_minutes(nodes[node_idx]['tw_start'])
         end = time_str_to_minutes(nodes[node_idx]['tw_end'])
+        
+        # Validar rangos antes de pasarlos a OR-Tools (CRUCIAL para evitar el error)
+        if start >= end:
+            # Si el tiempo de inicio es igual o posterior al de fin (ej: 07:00-07:00) o (19:00-07:00), 
+            # se fuerza un rango mínimo válido.
+            end = start + 60 # Forzar una hora de margen
+            
         time_dim.CumulVar(idx).SetRange(start, end)
         
     # Dimensión de Capacidad
@@ -135,7 +154,7 @@ def solve_vrptw(centro, puntos, df_flota):
                                             True, 
                                             "Capacity")
     
-    # Penalidad alta por no entregar (permite a OR-Tools dejar pedidos si no son factibles)
+    # Penalidad alta por no entregar
     for node_idx in range(1, N): 
         routing.AddDisjunction([manager.NodeToIndex(node_idx)], 1000000)
 
@@ -196,7 +215,6 @@ with st.sidebar:
     st.info("Sube un Excel con hojas: 'pedidos' y 'flota'")
     file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
     
-    # Lógica de carga de datos
     if file:
         try:
             xls = pd.ExcelFile(file)
@@ -207,10 +225,9 @@ with st.sidebar:
                 df_pedidos_loaded = pd.read_excel(file, sheet_name=pedidos_sheet)
                 df_flota_loaded = pd.read_excel(file, sheet_name=flota_sheet)
                 
-                # --- Preprocesamiento de PEDIDOS (Corrección de KeyError) ---
+                # --- Preprocesamiento de PEDIDOS ---
                 df_pedidos_loaded.columns = df_pedidos_loaded.columns.str.strip() 
                 
-                # Renombrar columnas clave a minúsculas y estandarizar
                 df_pedidos_loaded = df_pedidos_loaded.rename(columns={
                     'Latitud': 'lat', 
                     'Longitud': 'lon', 
@@ -219,7 +236,6 @@ with st.sidebar:
                     'Nombre Pedido': 'nombre_pedido' 
                 })
                 
-                # Fallback para columna 'nombre_pedido' si no existe
                 if 'nombre_pedido' not in df_pedidos_loaded.columns:
                     try:
                         df_pedidos_loaded = df_pedidos_loaded.rename(columns={col: 'nombre_pedido' for col in df_pedidos_loaded.columns if 'nombre' in col.lower()})
@@ -232,14 +248,22 @@ with st.sidebar:
                     df_pedidos_loaded['lon'] = df_pedidos_loaded['lon'] / 10
                     st.warning("⚠️ Coordenadas corregidas (división por 10).")
                 
-                # --- Preprocesamiento de FLOTA (Corrección de ValueError) ---
+                # --- CORRECCIÓN CRÍTICA DE TIEMPOS DE PEDIDOS ---
+                df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00'])).fillna('07:00')
+                df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00'])).fillna('19:00')
+                
+                # --- Preprocesamiento de FLOTA ---
                 df_flota_loaded.columns = df_flota_loaded.columns.str.strip().str.lower()
                 
-                # Limpiar y convertir a tipos numéricos, rellenando NaN con valores seguros
+                # Limpiar y convertir a tipos numéricos
                 df_flota_loaded['cantidad'] = df_flota_loaded['cantidad'].fillna(0).astype(int)
                 df_flota_loaded['capacidad_kg'] = df_flota_loaded['capacidad_kg'].fillna(0).astype(float)
                 df_flota_loaded['velocidad_kmh'] = df_flota_loaded['velocidad_kmh'].fillna(40).astype(float)
                 
+                # --- CORRECCIÓN CRÍTICA DE TIEMPOS DE FLOTA ---
+                df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(['07:00'])).fillna('07:00')
+                df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(['19:00'])).fillna('19:00')
+
                 # Guardar en estado de sesión
                 st.session_state.df_pedidos = df_pedidos_loaded
                 st.session_state.df_flota = df_flota_loaded
@@ -274,7 +298,6 @@ with st.sidebar:
 with col1:
     st.subheader("🗺️ Visualización de Rutas")
     
-    # Centrar el mapa en el CEDIS actual
     m = folium.Map(location=[st.session_state.cedis['lat'], st.session_state.cedis['lon']], zoom_start=11)
     
     # Dibujar CEDIS
@@ -351,5 +374,4 @@ with col2:
 
     with st.expander("Ver Pedidos Cargados"):
         if st.session_state.df_pedidos is not None:
-            # Se usa la columna 'nombre_pedido' estandarizada
             st.dataframe(st.session_state.df_pedidos[['nombre_pedido', 'peso', 'lat', 'lon', 'Tw_Start', 'Tw_End']])
