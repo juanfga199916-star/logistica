@@ -17,7 +17,6 @@ if 'route_metrics' not in st.session_state: st.session_state.route_metrics = Non
 if 'cedis' not in st.session_state: st.session_state.cedis = {'lat': 3.900, 'lon': -76.300, 'nombre': 'CEDIS Inicial (Buga)'}
 if 'df_pedidos' not in st.session_state: st.session_state.df_pedidos = None
 if 'df_flota' not in st.session_state: st.session_state.df_flota = None
-# NUEVO: Estado para detectar cambios en el CEDIS y forzar un recalculo
 if 'last_calculated_cedis' not in st.session_state: st.session_state.last_calculated_cedis = st.session_state.cedis.copy()
 
 
@@ -64,6 +63,7 @@ def solve_vrptw(centro, puntos, df_flota):
     
     if df_flota.empty: return None, None
     
+    # Los valores aquí serán cadenas de texto 'HH:MM' gracias al preprocesamiento
     depot_start_time = df_flota.iloc[0]['turno_inicio']
     depot_end_time = df_flota.iloc[0]['turno_fin']
     
@@ -78,7 +78,9 @@ def solve_vrptw(centro, puntos, df_flota):
             vehicle_speeds.append(float(row['velocidad_kmh']))
     
     num_vehicles = len(vehicle_pool)
-    if num_vehicles == 0: return None, None
+    if num_vehicles == 0: 
+        st.error("No hay vehículos disponibles en la flota.")
+        return None, None
     
     avg_speed_km_min = np.mean(vehicle_speeds) / 60.0 if vehicle_speeds else 1.0
     
@@ -118,22 +120,25 @@ def solve_vrptw(centro, puntos, df_flota):
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
     
     # Dimensión de Tiempo
+    # Máximo tiempo del turno + 60 minutos de holgura
     max_time = int(time_str_to_minutes(depot_end_time) + 60)
     routing.AddDimension(transit_idx, max_time, max_time, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
     
-    # Establecer rangos de tiempo
+    # Establecer rangos de tiempo (Time Windows)
     for node_idx in range(N):
         idx = manager.NodeToIndex(node_idx)
         start = time_str_to_minutes(nodes[node_idx]['tw_start'])
         end = time_str_to_minutes(nodes[node_idx]['tw_end'])
         
+        # Validar rangos: Asegurar que END es estrictamente mayor que START
         if start >= end:
+            # Forzar una ventana mínima válida (1 hora)
             end = start + 60 
             
         time_dim.CumulVar(idx).SetRange(start, end)
         
-    # Dimensión de Capacidad
+    # Dimensión de Capacidad (Peso)
     def demand_callback(from_idx):
         node = manager.IndexToNode(from_idx)
         return int(nodes[node]['demand'])
@@ -159,7 +164,7 @@ def solve_vrptw(centro, puntos, df_flota):
 
     if not solution: return None, None
 
-    # 6. Extraer rutas, métricas y el vehículo utilizado
+    # 6. Extracción de resultados
     rutas_info = []
     distancia_total = 0
     vehiculos_usados = []
@@ -202,7 +207,7 @@ col1, col2 = st.columns((3, 1))
 
 with st.sidebar:
     st.header("📂 1. Cargar Datos")
-    st.info("Sube un Excel con hojas: 'pedidos' y 'flota'")
+    st.info("Sube un Excel con hojas: 'pedidos' y 'flota'. Las rutas se calcularán automáticamente.")
     file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
     
     if file:
@@ -215,7 +220,7 @@ with st.sidebar:
                 df_pedidos_loaded = pd.read_excel(file, sheet_name=pedidos_sheet)
                 df_flota_loaded = pd.read_excel(file, sheet_name=flota_sheet)
                 
-                # Preprocesamiento
+                # Preprocesamiento de PEDIDOS
                 df_pedidos_loaded.columns = df_pedidos_loaded.columns.str.strip() 
                 df_pedidos_loaded = df_pedidos_loaded.rename(columns={
                     'Latitud': 'lat', 'Longitud': 'lon', 'Peso (kg)': 'peso', 'Vol (m³)': 'vol',
@@ -224,28 +229,47 @@ with st.sidebar:
                 if 'nombre_pedido' not in df_pedidos_loaded.columns:
                     df_pedidos_loaded['nombre_pedido'] = 'Pedido ' + df_pedidos_loaded.index.astype(str)
 
+                # Corrección de escala de coordenadas (se mantiene)
                 if 'lat' in df_pedidos_loaded.columns and df_pedidos_loaded['lat'].mean() > 15:
                     df_pedidos_loaded['lat'] = df_pedidos_loaded['lat'] / 10
                     df_pedidos_loaded['lon'] = df_pedidos_loaded['lon'] / 10
                     st.warning("⚠️ Coordenadas corregidas (división por 10).")
                 
-                # Limpieza y relleno de TIEMPOS
+                # --- CORRECCIÓN CRÍTICA: Relleno y Estandarización de TIEMPOS DE PEDIDOS ---
                 df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00'])).fillna('07:00')
                 df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00'])).fillna('19:00')
-                
+
+                # Forzar formato HH:MM (Solución al error SetRange)
+                try:
+                    df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded['Tw_Start'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
+                    df_pedidos_loaded['Tw_End'] = df_pedidos_loaded['Tw_End'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
+                except:
+                    st.warning("No se pudieron estandarizar los tiempos a HH:MM. El cálculo podría fallar si el formato es inconsistente.")
+
+
+                # Preprocesamiento de FLOTA
                 df_flota_loaded.columns = df_flota_loaded.columns.str.strip().str.lower()
                 df_flota_loaded['cantidad'] = df_flota_loaded['cantidad'].fillna(0).astype(int)
                 df_flota_loaded['capacidad_kg'] = df_flota_loaded['capacidad_kg'].fillna(0).astype(float)
                 df_flota_loaded['velocidad_kmh'] = df_flota_loaded['velocidad_kmh'].fillna(40).astype(float)
+                
+                # --- CORRECCIÓN CRÍTICA: Relleno y Estandarización de TIEMPOS DE FLOTA ---
                 df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(['07:00'])).fillna('07:00')
                 df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(['19:00'])).fillna('19:00')
+                
+                # Forzar formato HH:MM (Solución al error SetRange)
+                try:
+                    df_flota_loaded['turno_inicio'] = df_flota_loaded['turno_inicio'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
+                    df_flota_loaded['turno_fin'] = df_flota_loaded['turno_fin'].apply(lambda x: pd.to_datetime(x).strftime('%H:%M') if not isinstance(x, str) or len(x) > 5 else x)
+                except:
+                    pass
 
                 # Guardar en estado de sesión
                 st.session_state.df_pedidos = df_pedidos_loaded
                 st.session_state.df_flota = df_flota_loaded
                 st.session_state.puntos = st.session_state.df_pedidos.to_dict('records')
                 
-                # Reiniciar metricas para forzar el auto-cálculo en el próximo paso
+                # Reiniciar métricas para forzar el auto-cálculo
                 st.session_state.route_metrics = None 
                 st.success("✅ Datos cargados. Calculando rutas automáticamente...")
 
@@ -262,7 +286,6 @@ with st.sidebar:
     
     cedis_lat = col_lat.number_input("Latitud CEDIS", value=st.session_state.cedis['lat'], format="%.4f")
     cedis_lon = col_lon.number_input("Longitud CEDIS", value=st.session_state.cedis['lon'], format="%.4f")
-    # Actualizar st.session_state.cedis en cada cambio
     st.session_state.cedis = {'lat': cedis_lat, 'lon': cedis_lon, 'nombre': 'CEDIS Personalizado'}
     
     # --- 3. Costos y Cálculo ---
@@ -309,11 +332,14 @@ with col1:
 with col2:
     st.subheader("🚀 Cálculo y Resultados")
     
-    # --- LÓGICA DE AUTO-CÁLCULO (Se ejecuta al cargar datos o cambiar CEDIS) ---
+    # --- LÓGICA DE AUTO-CÁLCULO ---
     if st.session_state.df_pedidos is not None and st.session_state.df_flota is not None:
         
         # 1. Recalculo si la ruta no ha sido calculada O si la ubicación del CEDIS ha cambiado
-        if st.session_state.route_metrics is None or st.session_state.cedis != st.session_state.last_calculated_cedis:
+        cedis_changed = (st.session_state.cedis['lat'] != st.session_state.last_calculated_cedis['lat'] or
+                         st.session_state.cedis['lon'] != st.session_state.last_calculated_cedis['lon'])
+
+        if st.session_state.route_metrics is None or cedis_changed:
             
             with st.spinner("Calculando asignación de flota y rutas automáticamente..."):
                 rutas_info, metricas = solve_vrptw(st.session_state.cedis, st.session_state.puntos, st.session_state.df_flota)
@@ -327,12 +353,13 @@ with col2:
                 }
                 # Guardar el CEDIS calculado para detectar futuros cambios
                 st.session_state['last_calculated_cedis'] = st.session_state.cedis.copy()
+                st.success(f"Cálculo finalizado. {len(rutas_info)} vehículos utilizados.")
                 st.balloons()
             else:
                 st.session_state.route_metrics = None
-                st.error("No se encontró solución factible con los datos y tiempos cargados.")
+                st.error("No se encontró solución factible. Revisa la flota o las ventanas de tiempo.")
 
-        # 2. Si solo cambia el costo, actualizamos el costo en las métricas sin recalcular la ruta
+        # 2. Si solo cambia el costo, actualizamos el costo
         elif st.session_state.route_metrics and st.session_state.route_metrics['costo_por_km'] != costo_por_km:
             st.session_state.route_metrics['costo_por_km'] = costo_por_km
             st.info("Costo operacional actualizado automáticamente.") 
@@ -345,7 +372,7 @@ with col2:
         costo_total = distancia * st.session_state.route_metrics['costo_por_km']
         num_rutas = len(st.session_state.route_metrics['rutas_info'])
         
-        st.metric("Distancia Total Estimada", f"{distancia:.1f} km", delta=f"{num_rutas} Rutas")
+        st.metric("Distancia Total Estimada", f"{distancia:,.1f} km", delta=f"{num_rutas} Rutas")
         st.metric("Costo Operacional Total", f"$ {costo_total:,.0f} COP")
         
         st.subheader("Flota Asignada")
