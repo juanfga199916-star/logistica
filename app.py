@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,6 +10,7 @@ import json
 from math import radians, cos, sin, asin, sqrt
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import time
+import random
 
 # --- CONFIG ---
 st.set_page_config(page_title="Panel de Control de Rutas", page_icon="🗺️", layout="wide")
@@ -36,7 +36,10 @@ if 'last_fingerprint' not in st.session_state:
 # --- CONFIGURAR ORS ---
 # Si tienes ORS key ponla aquí; si no, deja vacía "" para usar fallback.
 ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImY5MTA5MmE2NzVmZDRhYjBhMTk4YjZiNWNiMWY2YjQzIiwiaCI6Im11cm11cjY0In0="  # <-- pega tu ORS key si deseas geometrías reales
-client = openrouteservice.Client(key=ORS_API_KEY) if ORS_API_KEY else None
+try:
+    client = openrouteservice.Client(key=ORS_API_KEY) if ORS_API_KEY else None
+except Exception:
+    client = None
 
 # --- HELPERS ---
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -100,41 +103,42 @@ def parse_single_sheet_excel(df_raw):
         if 'cedi' in rowstr or 'cedi de distribucion' in rowstr:
             # tomar la siguiente fila no vacía como info
             for j in range(i+1, min(i+5, nrows)):
-                if df0.iloc[j].str.strip().replace('','').sum() != '':
-                    # build cedi
+                # verificar si la fila tiene algún valor
+                if any([str(x).strip() != '' for x in df_raw.iloc[j].tolist()]):
                     first = df_raw.iloc[j,0] if pd.notna(df_raw.iloc[j,0]) else ''
                     second = df_raw.iloc[j,1] if df_raw.shape[1]>1 and pd.notna(df_raw.iloc[j,1]) else ''
                     cedi = {'name': str(first).strip(), 'direccion': str(second).strip()}
                     break
-        if 'caracteristicas de flota' in rowstr:
+        if 'caracteristicas de flota' in rowstr or 'características de flota' in rowstr:
             fleet_start = i+1
-        if 'caracteristicas de pedidos' in rowstr:
+        if 'caracteristicas de pedidos' in rowstr or 'características de pedidos' in rowstr:
             pedidos_start = i+1
 
     # Parse fleet table: asumimos filas hasta línea vacía
     fleet = []
     if fleet_start:
-        # encontrar filas con datos (hasta fila vacía)
         for i in range(fleet_start, nrows):
             row_vals = df_raw.iloc[i].tolist()
-            # si primera celda vacía -> fin
             if all([ (str(x).strip()=='' ) for x in row_vals ]):
                 break
-            # intentar extraer: tipo, capacidad_kg, capacidad_m3, velocidad_kmh, turno_inicio, turno_fin
             vals = [ (str(x).strip()) for x in row_vals if str(x).strip()!='' ]
-            # require at least 4 values (type, kg, m3, speed). optional shifts
             if len(vals) >= 4:
                 tipo = vals[0]
                 try:
                     kg = float(vals[1].replace(',','.'))
                 except:
-                    kg = float(vals[1]) if vals[1].replace('.','',1).isdigit() else 0.0
+                    try:
+                        kg = float(vals[1])
+                    except:
+                        kg = 0.0
                 try:
                     m3 = float(vals[2].replace(',','.'))
                 except:
                     m3 = 0.0
-                # speed may be vals[3] or vals[4]
-                speed = float(vals[3].replace(',','.')) if len(vals) >= 4 and str(vals[3]).replace('.','',1).isdigit() else 40.0
+                try:
+                    speed = float(vals[3].replace(',','.'))
+                except:
+                    speed = 40.0
                 shift_start = vals[4] if len(vals) >= 5 else '07:00'
                 shift_end = vals[5] if len(vals) >= 6 else '19:00'
                 fleet.append({'tipo': tipo, 'capacity_kg': kg, 'capacity_m3': m3, 'speed_kmh': speed, 'shift_start': shift_start, 'shift_end': shift_end})
@@ -143,17 +147,15 @@ def parse_single_sheet_excel(df_raw):
     if pedidos_start:
         # from pedidos_start find header row with 'nombre' or 'nombre_pedido'
         header_row = None
-        for i in range(pedidos_start, min(pedidos_start+5, nrows)):
+        for i in range(pedidos_start, min(pedidos_start+8, nrows)):
             row_lower = [str(x).strip().lower() for x in df0.iloc[i].tolist()]
             if any('nombre' in c for c in row_lower) and any('peso' in c for c in row_lower):
                 header_row = i
                 break
         if header_row is not None:
-            # read from header_row to end
             pedidos_df = df_raw.iloc[header_row: , :].copy()
             pedidos_df.columns = [str(c).strip().lower() for c in pedidos_df.iloc[0].tolist()]
             pedidos_df = pedidos_df.iloc[1:].reset_index(drop=True)
-            # drop fully empty rows
             pedidos_df = pedidos_df.dropna(how='all')
     return cedi, fleet, pedidos_df
 
@@ -356,6 +358,12 @@ def request_ors_route(coords_sequence):
 st.title("🗺️ Panel de Control para Optimización de Rutas (Formato único Excel)")
 st.write("Sube el archivo Excel (misma hoja con secciones: CEDI, CARACTERISTICAS DE FLOTA, CARACTERISTICAS DE PEDIDOS).")
 
+# Sidebar: cost input
+with st.sidebar:
+    st.header("Parámetros")
+    cost_per_km = st.number_input("Costo por kilómetro (unidad monetaria)", min_value=0.0, value=0.5, step=0.1)
+    st.write("Si quieres usar ORS activa tu API key en el código (si la tienes).")
+
 with st.sidebar:
     st.header("📂 Cargar archivo (única hoja con secciones)")
     uploaded = st.file_uploader("Selecciona .xlsx", type=['xlsx'])
@@ -371,6 +379,9 @@ with st.sidebar:
                     latc, lonc = geocode_address(cedi_info.get('direccion'), city_hint=None)
                     if latc:
                         st.session_state.map_center = [latc, lonc]
+                        # If centro not set, set it
+                        if not st.session_state.centro:
+                            st.session_state.centro = [latc, lonc]
             if fleet_list:
                 st.session_state.fleet = fleet_list
                 st.markdown("**Fleet loaded:**")
@@ -388,19 +399,36 @@ with st.sidebar:
                 for i, row in pedidos_df.iterrows():
                     # read fields safely
                     nombre = row.get('nombre_pedido') or row.get('nombre') or f'Pedido {i+1}'
-                    peso = float(str(row.get('peso',0)).replace(',','.')) if pd.notna(row.get('peso',None)) else 0.0
-                    volumen = float(str(row.get('volumen',0)).replace(',','.')) if pd.notna(row.get('volumen',None)) else 0.0
+                    peso = 0.0
+                    volumen = 0.0
+                    try:
+                        if pd.notna(row.get('peso', None)):
+                            peso = float(str(row.get('peso')).replace(',','.'))
+                    except:
+                        peso = 0.0
+                    try:
+                        if pd.notna(row.get('volumen', None)):
+                            volumen = float(str(row.get('volumen')).replace(',','.'))
+                    except:
+                        volumen = 0.0
                     prioridad = row.get('prioridad','Media')
-                    tws = row.get('tw_start','08:00')
-                    twf = row.get('tw_end','18:00')
+                    # normalize time fields
+                    tws = row.get('tw_start') or row.get('tw_start'.lower()) if False else row.get('tw_start','08:00')
+                    twf = row.get('tw_end') or row.get('tw_end'.lower()) if False else row.get('tw_end','18:00')
+                    # fallbacks for different column names
+                    if not tws and 'tw_start' in pedidos_df.columns:
+                        tws = pedidos_df.at[i,'tw_start']
+                    if not twf and 'tw_end' in pedidos_df.columns:
+                        twf = pedidos_df.at[i,'tw_end']
                     ciudad = row.get('ciudad', None)
                     direccion = row.get('direccion', None) or row.get('dirección', None)
                     lat, lon = None, None
                     # If lat/lon exist as columns
-                    if 'lat' in pedidos_df.columns and 'lon' in pedidos_df.columns:
+                    if 'lat' in pedidos_df.columns and ('lon' in pedidos_df.columns or 'longitud' in pedidos_df.columns):
+                        lon_col = 'lon' if 'lon' in pedidos_df.columns else 'longitud'
                         try:
                             lat = float(row.get('lat'))
-                            lon = float(row.get('lon'))
+                            lon = float(row.get(lon_col))
                         except:
                             lat, lon = None, None
                     # else geocode from direccion + ciudad
@@ -416,8 +444,8 @@ with st.sidebar:
                             'tw_start': str(tws),
                             'tw_end': str(twf),
                             'direccion': direccion,
-                            'lat': lat,
-                            'lon': lon,
+                            'lat': float(lat),
+                            'lon': float(lon),
                             'service_time': int(float(row.get('service_time',5))) if 'service_time' in pedidos_df.columns else 5
                         })
                         loaded += 1
@@ -456,31 +484,66 @@ with st.sidebar:
                     else:
                         # solicitar ORS para cada ruta si client existe, sino fallback lineas rectas
                         features = []
+                        per_route_metrics = []  # each: {'vehicle_idx','vehicle_tipo','distance_km','duration_s'}
                         total_distance_m = 0
                         total_duration_s = 0
                         for r in routes_info:
                             coords = r.get('coords', [])
                             if not coords:
                                 continue
+                            # coords are [lon, lat] pairs
                             if client:
                                 feat, m = request_ors_route(coords)
-                                if feat:
+                                if feat and m:
                                     features.append(feat)
-                                    total_distance_m += m['distance_m']
-                                    total_duration_s += m['duration_s']
+                                    route_distance_m = m['distance_m']
+                                    route_duration_s = m['duration_s']
                                 else:
+                                    # fallback: estimate from straight-line segments
+                                    route_distance_km = 0.0
+                                    for k in range(len(coords)-1):
+                                        lon1, lat1 = coords[k]
+                                        lon2, lat2 = coords[k+1]
+                                        route_distance_km += haversine_km(lat1, lon1, lat2, lon2)
+                                    route_distance_m = route_distance_km * 1000
+                                    # estimate duration using average fleet speed (m/s)
+                                    avg_speed_kmh = np.mean([f.get('speed_kmh',40) for f in st.session_state.fleet]) if st.session_state.fleet else 40
+                                    route_duration_s = (route_distance_km / max(avg_speed_kmh,0.1)) * 3600
+                                    # add GeoJSON line
                                     ls = {"type":"Feature","properties":{"vehicle":r['vehicle_tipo']},"geometry":{"type":"LineString","coordinates":coords}}
                                     features.append(ls)
                             else:
+                                # No ORS: compute straight-line distance
+                                route_distance_km = 0.0
+                                for k in range(len(coords)-1):
+                                    lon1, lat1 = coords[k]
+                                    lon2, lat2 = coords[k+1]
+                                    route_distance_km += haversine_km(lat1, lon1, lat2, lon2)
+                                route_distance_m = route_distance_km * 1000
+                                avg_speed_kmh = np.mean([f.get('speed_kmh',40) for f in st.session_state.fleet]) if st.session_state.fleet else 40
+                                route_duration_s = (route_distance_km / max(avg_speed_kmh,0.1)) * 3600
                                 ls = {"type":"Feature","properties":{"vehicle":r['vehicle_tipo']},"geometry":{"type":"LineString","coordinates":coords}}
                                 features.append(ls)
+
+                            per_route_metrics.append({
+                                'vehicle_idx': r.get('vehicle_idx'),
+                                'vehicle_tipo': r.get('vehicle_tipo'),
+                                'distance_km': round(route_distance_m/1000, 3),
+                                'duration_min': round(route_duration_s/60, 1),
+                                'cost': round((route_distance_m/1000) * cost_per_km, 2)
+                            })
+                            total_distance_m += route_distance_m
+                            total_duration_s += route_duration_s
+
                         if features:
                             fc = {"type":"FeatureCollection","features":features}
                             st.session_state.route_geojson = fc
-                            if total_distance_m>0:
-                                st.session_state.route_metrics = {"distance_m": total_distance_m, "duration_s": total_duration_s}
+                            # totals
+                            if total_distance_m > 0:
+                                st.session_state.route_metrics = {"distance_m": total_distance_m, "duration_s": total_duration_s, "per_route": per_route_metrics}
                             else:
-                                st.session_state.route_metrics = {"distance_m": metrics_est['distance_km']*1000, "duration_s": metrics_est['time_min']*60}
+                                # fallback to solver estimates (km -> m)
+                                st.session_state.route_metrics = {"distance_m": metrics_est['distance_km']*1000, "duration_s": metrics_est['time_min']*60, "per_route": per_route_metrics}
                             st.session_state.last_fingerprint = fp
                             st.success("Rutas calculadas y visualizadas.")
                         else:
@@ -490,17 +553,56 @@ with st.sidebar:
 col1, col2 = st.columns((2,1))
 with col1:
     st.subheader("Mapa")
-    m = folium.Map(location=st.session_state.map_center, zoom_start=12)
-    # center marker
-    if st.session_state.centro:
-        folium.Marker(st.session_state.centro, icon=folium.Icon(color='red', icon='home'), popup="Centro").add_to(m)
-    # pedidos markers
+    m = folium.Map(location=st.session_state.map_center, zoom_start=11, tiles="OpenStreetMap")
+
+    # Add base layer group for pedidos by priority
+    priority_layer = folium.FeatureGroup(name="Pedidos (por prioridad)", show=True)
+    # priority colors
+    pr_colors = {'alta':'red','media':'orange','baja':'green'}
     for i,p in enumerate(st.session_state.puntos):
+        pr = str(p.get('prioridad','Media')).strip().lower()
+        color = pr_colors.get(pr, 'blue')
         popup_html = f"<b>{p.get('nombre')}</b><br>Prio: {p.get('prioridad')}<br>Peso: {p.get('peso')} kg<br>Vol: {p.get('volumen')} m3<br>TW: {p.get('tw_start')} - {p.get('tw_end')}<br>{p.get('direccion','')}"
-        folium.Marker([p['lat'], p['lon']], popup=popup_html, tooltip=f"Punto {i+1}").add_to(m)
-    # rutas GeoJson
+        folium.CircleMarker(location=[p['lat'], p['lon']],
+                            radius=6 + min(max(p.get('peso',0)/20, 0), 10),
+                            color=color,
+                            fill=True,
+                            fill_opacity=0.9,
+                            popup=popup_html,
+                            tooltip=f"{p.get('nombre')} ({p.get('prioridad')})").add_to(priority_layer)
+    priority_layer.add_to(m)
+
+    # Center marker
+    if st.session_state.centro:
+        folium.Marker(location=st.session_state.centro, icon=folium.Icon(color='darkred', icon='home'), popup="Centro").add_to(m)
+
+    # If we have route GeoJSON, add each feature in its own layer with distinct colors
     if st.session_state.route_geojson:
-        folium.GeoJson(st.session_state.route_geojson, name='Rutas', style_function=lambda feat: {"color":"blue","weight":4,"opacity":0.8}).add_to(m)
+        # choose distinct colors
+        colors = ['blue','purple','cadetblue','darkgreen','darkorange','black','pink','gray']
+        # iterate features and add to separate groups
+        for idx, feat in enumerate(st.session_state.route_geojson.get('features', [])):
+            veh = feat.get('properties', {}).get('vehicle', f'Ruta {idx+1}')
+            color = colors[idx % len(colors)]
+            layer = folium.FeatureGroup(name=f"Ruta: {veh}", show=(idx==0))
+            geom = feat.get('geometry', {})
+            if geom and geom.get('type') == 'LineString':
+                coords = geom.get('coordinates', [])
+                # folium expects [lat, lon]
+                polyline = [[c[1], c[0]] for c in coords]
+                folium.PolyLine(locations=polyline, color=color, weight=4, opacity=0.8, popup=f"Veh: {veh}").add_to(layer)
+                # add start/end markers
+                folium.CircleMarker(location=polyline[0], radius=5, color=color, fill=True, fill_opacity=1, popup=f"{veh} inicio").add_to(layer)
+                folium.CircleMarker(location=polyline[-1], radius=5, color=color, fill=True, fill_opacity=1, popup=f"{veh} fin").add_to(layer)
+            else:
+                # generic geometry fallback: draw as GeoJson
+                folium.GeoJson(feat, style_function=lambda x, col=color: {"color":col,"weight":4}).add_to(layer)
+            layer.add_to(m)
+
+    # Layer control
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # Render map
     map_data = st_folium(m, width='100%', height=650)
 
     # click handling: select center or (optionally) allow manual adding for pedidos without coords
@@ -511,7 +613,7 @@ with col1:
             st.session_state.seleccionando_centro = False
             st.success("Centro definido en el mapa.")
         else:
-            # Manual ad-hoc add: append default pedido (only if no pedidos from file)
+            # Manual ad-hoc add
             st.session_state.puntos.append({'nombre': f'Punto {len(st.session_state.puntos)+1}', 'peso':0.0,'volumen':0.0,'prioridad':'Media','tw_start':'08:00','tw_end':'18:00','direccion':'','lat':lat,'lon':lon,'service_time':5})
             st.success("Punto agregado manualmente.")
 
@@ -519,17 +621,29 @@ with col2:
     st.subheader("Estadísticas & KPIs")
     num = len(st.session_state.puntos)
     st.metric("Pedidos totales", num)
+    # If route metrics exist, show consolidated KPIs and table
     if st.session_state.route_metrics:
         dist_km = st.session_state.route_metrics['distance_m']/1000
         dur_min = st.session_state.route_metrics['duration_s']/60
-        st.metric("Distancia total (real)", f"{dist_km:.2f} km")
-        st.metric("Tiempo total (real)", f"{dur_min:.0f} min")
-        # cost estimate (ejemplo simple: costo por km)
-        cost_per_km = 0.5  # ejemplo COP? ajusta según necesites
-        st.metric("Costo estimado", f"{(dist_km * cost_per_km):.2f} (unidad)")
+        st.metric("Distancia total (estimada)", f"{dist_km:.2f} km")
+        st.metric("Tiempo total (estimado)", f"{dur_min:.0f} min")
+        total_cost = dist_km * cost_per_km
+        st.metric("Costo estimado (total)", f"{total_cost:.2f}")
+        # show per-route table if available
+        per_route = st.session_state.route_metrics.get('per_route', [])
+        if per_route:
+            df_per_route = pd.DataFrame(per_route)
+            # add readable columns
+            df_per_route = df_per_route[['vehicle_tipo','distance_km','duration_min','cost']].rename(columns={
+                'vehicle_tipo':'Vehículo',
+                'distance_km':'Distancia (km)',
+                'duration_min':'Duración (min)',
+                'cost':'Costo'
+            })
+            st.subheader("Métricas por ruta/vehículo")
+            st.dataframe(df_per_route, use_container_width=True)
     else:
-        st.info("Aún no se han calculado rutas.")
+        st.info("Aún no se han calculado rutas. Usa 'Calcular rutas (VRPTW)' en la barra lateral.")
 
 st.subheader("Detalle Pedidos")
 st.dataframe(crear_tabla_de_pedidos(st.session_state.puntos), use_container_width=True)
-
