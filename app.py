@@ -68,7 +68,6 @@ def solve_vrptw(centro, puntos, fleet_cfg, num_vehicles_override=None):
                 km = haversine_km(nodes[i]['lat'], nodes[i]['lon'], nodes[j]['lat'], nodes[j]['lon'])
                 dist_matrix[i][j] = km
                 time_matrix[i][j] = (km / speed_km_min)
-            # sumar servicio al destino
             time_matrix[i][j] += nodes[j]['service']
 
     # OR-Tools
@@ -112,31 +111,53 @@ def solve_vrptw(centro, puntos, fleet_cfg, num_vehicles_override=None):
     rutas_coords = []
     distancia_total = 0.0
     vehiculos_usados = []
+
+    # NUEVO: lista para distancias por ruta
+    distancias_rutas = []
+
     for vehicle_id in range(num_vehicles):
         index = routing.Start(vehicle_id)
-        route = [[nodes[0]['lat'], nodes[0]['lon']]]  # inicio en depósito
+        route = [[nodes[0]['lat'], nodes[0]['lon']]]
         used = False
-        prev_node = manager.IndexToNode(index)
+
+        # NUEVO: distancia por ruta
+        distancia_ruta = 0.0
+
         while not routing.IsEnd(index):
             node_idx = manager.IndexToNode(index)
-            # si no es depósito y no repetido, agregar
             if node_idx != 0:
                 route.append([nodes[node_idx]['lat'], nodes[node_idx]['lon']])
                 used = True
+
             previous_index = index
             index = solution.Value(routing.NextVar(index))
-            # sumar distancia entre previous->current
+
             curr_node = manager.IndexToNode(index)
+
+            # distancia total
             distancia_total += dist_matrix[manager.IndexToNode(previous_index)][curr_node]
+
+            # NUEVO: distancia de esta ruta
+            distancia_ruta += dist_matrix[manager.IndexToNode(previous_index)][curr_node]
+
         route.append([nodes[0]['lat'], nodes[0]['lon']])
+
         if used:
             rutas_coords.append(route)
             vehiculos_usados.append(f"{vehicle_id+1}")
+
+            # NUEVO: guardar distancia individual
+            distancias_rutas.append(distancia_ruta)
+
     metrics = {
         "distancia_km": distancia_total,
         "vehiculos_usados": vehiculos_usados,
-        "num_vehiculos_usados": len(vehiculos_usados)
+        "num_vehiculos_usados": len(vehiculos_usados),
+
+        # NUEVO: enviar distancias individuales al frontend
+        "distancias_por_ruta": distancias_rutas
     }
+
     return rutas_coords, metrics
 
 # --- INTERFAZ ---
@@ -148,7 +169,6 @@ with st.sidebar:
     st.info("Sube un Excel con hojas: 'pedidos' y 'flota' (o nombres que contengan 'pedido' y 'flota').")
     file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
 
-    # Slider costo por km
     costo_km = st.slider("Costo por kilómetro (moneda local)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
 
     st.divider()
@@ -168,7 +188,6 @@ with st.sidebar:
 
     st.divider()
     st.header("📦 3. Parámetros flota")
-    # Cargar datos de flota tras subir fichero
     df_pedidos = None
     df_flota = None
     selected_fleet = None
@@ -180,7 +199,6 @@ with st.sidebar:
             if pedidos_sheet and flota_sheet:
                 df_pedidos = pd.read_excel(file, sheet_name=pedidos_sheet)
                 df_flota = pd.read_excel(file, sheet_name=flota_sheet)
-                # normalizar nombres columnas
                 df_pedidos.columns = df_pedidos.columns.str.strip()
                 df_pedidos = df_pedidos.rename(columns={'Latitud':'lat', 'Longitud':'lon', 'Peso (kg)':'peso', 'Peso':'peso'})
                 if 'lat' in df_pedidos.columns and df_pedidos['lat'].mean() > 15:
@@ -189,19 +207,16 @@ with st.sidebar:
                     st.warning("Detecté coordenadas mal escaladas y las corregí dividiendo por 10.")
                 df_flota.columns = df_flota.columns.str.strip().str.lower()
                 st.success("✅ Datos cargados correctamente.")
-                # select vehiculo
                 if 'tipo_vehiculo' in df_flota.columns:
                     vehiculo_elegido = st.selectbox("Tipo de vehículo", df_flota['tipo_vehiculo'].unique())
                     selected_fleet_series = df_flota[df_flota['tipo_vehiculo'] == vehiculo_elegido].iloc[0]
                     selected_fleet = selected_fleet_series.to_dict()
-                    # asegurar claves
                     selected_fleet.setdefault('cantidad', int(selected_fleet.get('cantidad', 1)))
                     selected_fleet.setdefault('capacidad_kg', float(selected_fleet.get('capacidad_kg', 1000)))
                     selected_fleet.setdefault('velocidad_kmh', float(selected_fleet.get('velocidad_kmh', 40)))
                     selected_fleet.setdefault('turno_inicio', selected_fleet.get('turno_inicio', '07:00'))
                     selected_fleet.setdefault('turno_fin', selected_fleet.get('turno_fin', '19:00'))
                     st.caption(f"Configuración: {int(selected_fleet.get('cantidad',1))} x {vehiculo_elegido} (cap {selected_fleet.get('capacidad_kg')} kg)")
-                    # guardar pedidos en sesión para visualizar en mapa
                     st.session_state.puntos = df_pedidos.to_dict('records')
                     if 'lat' in df_pedidos.columns:
                         st.session_state.map_center = [df_pedidos.iloc[0]['lat'], df_pedidos.iloc[0]['lon']]
@@ -218,38 +233,29 @@ with st.sidebar:
 col1, col2 = st.columns((3,1))
 with col1:
     m = folium.Map(location=st.session_state.map_center, zoom_start=11)
-    # dibujar cedis en mapa
     for i, c in enumerate(st.session_state.cedis):
         folium.Marker(location=[c['lat'], c['lon']], tooltip=f"CEDI {i+1}: {c['nombre']}",
                       icon=folium.Icon(color='darkgreen', icon='warehouse')).add_to(m)
-    # dibujar pedidos
     for p in st.session_state.puntos:
         folium.CircleMarker(location=[p['lat'], p['lon']], radius=5, color="blue", fill=True,
                             tooltip=f"{p.get('Nombre Pedido', p.get('nombre','Pedido'))} | {p.get('peso',0)}kg").add_to(m)
 
-    # graficar lineas rectas CEDI->pedidos (si hay CEDI seleccionado)
     if seleccion_cedi_idx is not None and st.session_state.cedis:
         cedi_act = st.session_state.cedis[seleccion_cedi_idx]
         for p in st.session_state.puntos:
             folium.PolyLine([[cedi_act['lat'], cedi_act['lon']], [p['lat'], p['lon']]],
                             color='gray', weight=1.5, dash_array='5').add_to(m)
 
-    # botón calcular rutas
     if selected_fleet and st.button("🚀 Calcular Rutas & Costos"):
-        # seleccionar centro (CEDI activo) o fallback al primer punto
         if seleccion_cedi_idx is not None and st.session_state.cedis:
             centro = [st.session_state.cedis[seleccion_cedi_idx]['lat'], st.session_state.cedis[seleccion_cedi_idx]['lon']]
         else:
             centro = [st.session_state.puntos[0]['lat'], st.session_state.puntos[0]['lon']]
 
-        # calcular número mínimo de vehículos necesarios según demanda total y capacidad
         total_demand = sum([float(p.get('peso', 0) or 0) for p in st.session_state.puntos])
         cap_kg = float(selected_fleet.get('capacidad_kg', 1000))
         num_necesarios = max(1, ceil(total_demand / cap_kg))
-        # limitar a la cantidad disponible en la hoja si aparece 'cantidad'
         cantidad_disponible = int(selected_fleet.get('cantidad', num_necesarios))
-        num_vehicles_to_use = min(cantidad_disponible, max(cantidad_disponible, num_necesarios))  # si queremos usar tantos como sean necesarios, aquí simplificamos: usamos num_necesarios pero no menos que 1
-        # para permitir usar más vehículos que la hoja indica (si se desea), podrías cambiar la lógica. Aquí usamos num_necesarios.
         num_vehicles_to_use = num_necesarios
 
         rutas, metricas = solve_vrptw(centro, st.session_state.puntos, selected_fleet, num_vehicles_override=num_vehicles_to_use)
@@ -260,7 +266,6 @@ with col1:
                     folium.PolyLine(ruta, weight=4, color=colors[i % len(colors)], opacity=0.8,
                                     tooltip=f"Ruta {i+1}").add_to(m)
             st.session_state.route_metrics = metricas
-            # calcular costo
             costo_total = metricas['distancia_km'] * costo_km
             st.success("Rutas optimizadas con éxito.")
             st.info(f"Se usaron {metricas['num_vehiculos_usados']} vehículo(s). Distancia estimada: {metricas['distancia_km']:.2f} km. Costo estimado: {costo_total:.2f}")
@@ -277,8 +282,15 @@ with col2:
         st.metric("Distancia Total Estimada", f"{dist:.1f} km")
         costo_total = dist * costo_km
         st.metric("Costo Estimado (km)", f"{costo_total:.2f}")
+
         st.write("Vehículos usados (IDs):", ", ".join(st.session_state.route_metrics.get('vehiculos_usados', [])))
         st.write("Número de vehículos usados:", st.session_state.route_metrics.get('num_vehiculos_usados', 0))
+
+        # NUEVO: MOSTRAR DISTANCIA Y COSTO POR RUTA
+        st.subheader("📌 Costos por Ruta")
+        for i, d in enumerate(st.session_state.route_metrics["distancias_por_ruta"], start=1):
+            st.write(f"Ruta {i}: {d:.2f} km — Costo: {(d * costo_km):.2f}")
+
     else:
         st.info("Aún no hay rutas calculadas.")
 
@@ -299,5 +311,5 @@ with col2:
         else:
             st.write("No hay CEDIS registrados.")
 
-    st.caption("Notas: La distancia se calcula en línea recta (Haversine). El modelo intenta respetar ventanas de tiempo y capacidades. Ajusta capacidad/velocidad en la hoja 'flota' si necesitas precisión realista.")
+    st.caption("Notas: La distancia se calcula en línea recta (Haversine). El modelo intenta respetar ventanas de tiempo y capacidades.")
 
