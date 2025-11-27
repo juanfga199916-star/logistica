@@ -14,6 +14,7 @@ if 'puntos' not in st.session_state: st.session_state.puntos = []
 if 'map_center' not in st.session_state: st.session_state.map_center = [3.900, -76.300]
 if 'route_metrics' not in st.session_state: st.session_state.route_metrics = None
 if 'cedis' not in st.session_state: st.session_state.cedis = []  # lista de dicts {'lat':..., 'lon':..., 'nombre':...}
+if 'rutas_coords' not in st.session_state: st.session_state.rutas_coords = []  # guardará rutas para persistencia en mapa
 
 # --- FUNCIONES AUXILIARES ---
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -233,18 +234,35 @@ with st.sidebar:
 col1, col2 = st.columns((3,1))
 with col1:
     m = folium.Map(location=st.session_state.map_center, zoom_start=11)
+
+    # dibujar cedis en mapa
     for i, c in enumerate(st.session_state.cedis):
         folium.Marker(location=[c['lat'], c['lon']], tooltip=f"CEDI {i+1}: {c['nombre']}",
                       icon=folium.Icon(color='darkgreen', icon='warehouse')).add_to(m)
+
+    # dibujar pedidos
     for p in st.session_state.puntos:
         folium.CircleMarker(location=[p['lat'], p['lon']], radius=5, color="blue", fill=True,
                             tooltip=f"{p.get('Nombre Pedido', p.get('nombre','Pedido'))} | {p.get('peso',0)}kg").add_to(m)
 
+    # graficar lineas rectas CEDI->pedidos (si hay CEDI seleccionado)
     if seleccion_cedi_idx is not None and st.session_state.cedis:
         cedi_act = st.session_state.cedis[seleccion_cedi_idx]
         for p in st.session_state.puntos:
             folium.PolyLine([[cedi_act['lat'], cedi_act['lon']], [p['lat'], p['lon']]],
                             color='gray', weight=1.5, dash_array='5').add_to(m)
+
+    # 🔥 Dibujar rutas guardadas en session_state (persisten entre reruns)
+    colors = ['red','green','blue','orange','purple','black','cadetblue','darkred']
+    if st.session_state.rutas_coords:
+        for i, ruta in enumerate(st.session_state.rutas_coords):
+            if len(ruta) > 1:
+                folium.PolyLine(ruta, weight=4, color=colors[i % len(colors)], opacity=0.9,
+                                tooltip=f"Ruta {i+1}").add_to(m)
+            # dibujar puntos de la ruta
+            for j, punto in enumerate(ruta):
+                folium.CircleMarker(location=punto, radius=3, fill=True,
+                                    tooltip=f"R{i+1}-P{j+1}").add_to(m)
 
     if selected_fleet and st.button("🚀 Calcular Rutas & Costos"):
         if seleccion_cedi_idx is not None and st.session_state.cedis:
@@ -260,11 +278,15 @@ with col1:
 
         rutas, metricas = solve_vrptw(centro, st.session_state.puntos, selected_fleet, num_vehicles_override=num_vehicles_to_use)
         if rutas:
-            colors = ['red','green','blue','orange','purple','black','cadetblue','darkred']
+            # Guardar rutas en session_state para que no desaparezcan
+            st.session_state.rutas_coords = rutas.copy()
+
+            # dibujar rutas recién calculadas en el mapa (también persistirán)
             for i, ruta in enumerate(rutas):
                 if len(ruta) > 1:
                     folium.PolyLine(ruta, weight=4, color=colors[i % len(colors)], opacity=0.8,
                                     tooltip=f"Ruta {i+1}").add_to(m)
+
             st.session_state.route_metrics = metricas
             costo_total = metricas['distancia_km'] * costo_km
             st.success("Rutas optimizadas con éxito.")
