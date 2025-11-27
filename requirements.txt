@@ -6,10 +6,14 @@ streamlit-folium
 geopy
 openrouteservice
 ortools
-openpyxl
+plotly
+matplotlib
+scikit-learn
+pyproj
+shapely
 requests
-protobuf
-python-dotenv
+openpyxl
+
 
 
 
