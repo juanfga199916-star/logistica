@@ -30,7 +30,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 6371 * 2 * asin(sqrt(a))
 
 def time_str_to_minutes(t):
-    """Convierte un string, datetime.time o Timestamp a minutos desde la medianoche."""
+    """
+    Convierte un objeto de tiempo (Timestamp, datetime.time) o una cadena 
+    de texto (HH:MM o HH:MM:SS) a minutos desde la medianoche.
+    """
     
     # 1. Manejar objetos de tiempo de Pandas/Python
     if isinstance(t, pd.Timestamp):
@@ -39,11 +42,14 @@ def time_str_to_minutes(t):
     if isinstance(t, datetime.time):
         return t.hour * 60 + t.minute
         
-    # 2. Manejar cadenas de texto (HH:MM)
+    # 2. Manejar cadenas de texto (HH:MM o HH:MM:SS)
     if isinstance(t, str):
         try:
-            h, m = map(int, t.split(':'))
-            return h*60 + m
+            parts = t.split(':')
+            h = int(parts[0])
+            m = int(parts[1]) if len(parts) > 1 else 0
+            # Ignoramos segundos si están presentes
+            return h * 60 + m
         except: 
             return 420 # 7:00 AM (420 min) como default
     
@@ -85,7 +91,7 @@ def solve_vrptw(centro, puntos, df_flota):
         st.error("No hay vehículos disponibles en la flota.")
         return None, None
     
-    avg_speed_km_min = np.mean(vehicle_speeds) / 60.0 if vehicle_speeds else 1.0 # Velocidad segura
+    avg_speed_km_min = np.mean(vehicle_speeds) / 60.0 if vehicle_speeds else 1.0
     
     # 2. Crear Nodos
     nodes = [{'lat': centro['lat'], 'lon': centro['lon'], 'demand': 0, 'service': 0, 
@@ -94,8 +100,9 @@ def solve_vrptw(centro, puntos, df_flota):
     for p in puntos:
         nodes.append({
             'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': 15,
-            'tw_start': str(p.get('Tw_Start', '07:00')), 
-            'tw_end': str(p.get('Tw_End', '19:00'))
+            # CRÍTICO: NO forzar a str() aquí. Dejamos que time_str_to_minutes maneje el tipo.
+            'tw_start': p.get('Tw_Start', '07:00'), 
+            'tw_end': p.get('Tw_End', '19:00')
         })
     N = len(nodes)
     
@@ -133,11 +140,10 @@ def solve_vrptw(centro, puntos, df_flota):
         start = time_str_to_minutes(nodes[node_idx]['tw_start'])
         end = time_str_to_minutes(nodes[node_idx]['tw_end'])
         
-        # Validar rangos antes de pasarlos a OR-Tools (CRUCIAL para evitar el error)
+        # Validación de rango final y robusta
         if start >= end:
-            # Si el tiempo de inicio es igual o posterior al de fin (ej: 07:00-07:00) o (19:00-07:00), 
-            # se fuerza un rango mínimo válido.
-            end = start + 60 # Forzar una hora de margen
+            # Si el tiempo de inicio es igual o posterior al de fin, forzamos un rango válido
+            end = start + 60 
             
         time_dim.CumulVar(idx).SetRange(start, end)
         
@@ -248,7 +254,8 @@ with st.sidebar:
                     df_pedidos_loaded['lon'] = df_pedidos_loaded['lon'] / 10
                     st.warning("⚠️ Coordenadas corregidas (división por 10).")
                 
-                # --- CORRECCIÓN CRÍTICA DE TIEMPOS DE PEDIDOS ---
+                # --- CRÍTICO: Limpieza y relleno de TIEMPOS DE PEDIDOS ---
+                # Rellena NaN con el default '07:00' o '19:00' si la columna existe.
                 df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00'])).fillna('07:00')
                 df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00'])).fillna('19:00')
                 
@@ -260,7 +267,7 @@ with st.sidebar:
                 df_flota_loaded['capacidad_kg'] = df_flota_loaded['capacidad_kg'].fillna(0).astype(float)
                 df_flota_loaded['velocidad_kmh'] = df_flota_loaded['velocidad_kmh'].fillna(40).astype(float)
                 
-                # --- CORRECCIÓN CRÍTICA DE TIEMPOS DE FLOTA ---
+                # --- CRÍTICO: Limpieza y relleno de TIEMPOS DE FLOTA ---
                 df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(['07:00'])).fillna('07:00')
                 df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(['19:00'])).fillna('19:00')
 
@@ -275,7 +282,7 @@ with st.sidebar:
                 st.error("El Excel debe tener hojas llamadas 'pedidos' y 'flota'.")
         
         except Exception as e:
-            st.error(f"Error procesando el archivo: {e}")
+            st.error(f"Error procesando el archivo. Revise el formato de las columnas de tiempo (Tw_Start, Tw_End): {e}")
             
     # --- 2. Ingreso Manual del CEDIS ---
     st.divider()
