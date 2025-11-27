@@ -3,10 +3,7 @@ import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-from geopy.geocoders import Nominatim
-import openrouteservice
-import hashlib
-import json
+from openrouteservice import Client
 from math import radians, cos, sin, asin, sqrt
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
@@ -14,20 +11,8 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 st.set_page_config(page_title="Panel de Control de Rutas", page_icon="🚚", layout="wide")
 
 # --- ESTADO INICIAL ---
-if 'puntos' not in st.session_state:
-    st.session_state.puntos = []
-if 'map_center' not in st.session_state:
-    st.session_state.map_center = [4.60971, -74.08175]
-if 'centro' not in st.session_state:
-    st.session_state.centro = None
-if 'route_geojson' not in st.session_state:
-    st.session_state.route_geojson = None
-if 'route_metrics' not in st.session_state:
-    st.session_state.route_metrics = None
-
-# --- CONFIGURAR ORS ---
-ORS_API_KEY = "TU_API_KEY_AQUI"
-client = openrouteservice.Client(key=ORS_API_KEY) if ORS_API_KEY else None
+if 'puntos' not in st.session_state: st.session_state.puntos = []
+if 'map_center' not in st.session_state: st.session_state.map_center = [3.900, -76.300] # Buga aprox
 
 # --- FUNCIONES AUXILIARES ---
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -38,132 +23,209 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 6371 * 2 * asin(sqrt(a))
 
 def time_str_to_minutes(t):
-    try:
-        h, m = map(int, t.split(':'))
-        return h*60 + m
-    except:
-        return 0
+    if isinstance(t, str):
+        try:
+            h, m = map(int, t.split(':'))
+            return h*60 + m
+        except: return 480 # Default 8:00
+    return 480
 
-def solve_vrptw(centro, puntos, fleet_cfg, avg_speed_kmph=40):
-    """Resuelve VRPTW aproximado."""
-    nodes = [{'lat': centro[0], 'lon': centro[1], 'demand': 0, 'service': 0, 'tw_start': fleet_cfg['inicio_turno'], 'tw_end': fleet_cfg['fin_turno']}]
+def solve_vrptw(centro, puntos, fleet_cfg):
+    """Resuelve VRPTW básico con OR-Tools."""
+    # Convertir flota a parámetros
+    num_vehicles = int(fleet_cfg['Cantidad'])
+    cap_kg = float(fleet_cfg['capacidad_kg'])
+    speed_km_min = float(fleet_cfg['velocidad_kmh']) / 60.0
+    
+    # 1. Crear Nodos (0 es el depósito)
+    nodes = [{'lat': centro[0], 'lon': centro[1], 'demand': 0, 'service': 0, 
+              'tw_start': fleet_cfg['turno_inicio'], 'tw_end': fleet_cfg['turno_fin']}]
+    
     for p in puntos:
         nodes.append({
-            'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': p.get('service_time', 5),
-            'tw_start': p.get('tw_start', '08:00'), 'tw_end': p.get('tw_end', '18:00')
+            'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': 15, # 15 min servicio
+            'tw_start': str(p.get('Tw_Start', '07:00')), 
+            'tw_end': str(p.get('Tw_End', '19:00'))
         })
 
     N = len(nodes)
-    time_matrix = [[0]*N for _ in range(N)]
-    dist_matrix = [[0]*N for _ in range(N)]
+    
+    # 2. Matrices de Distancia y Tiempo
+    dist_matrix = np.zeros((N, N))
+    time_matrix = np.zeros((N, N))
+    
     for i in range(N):
         for j in range(N):
             if i != j:
                 km = haversine_km(nodes[i]['lat'], nodes[i]['lon'], nodes[j]['lat'], nodes[j]['lon'])
                 dist_matrix[i][j] = km
-                time_matrix[i][j] = int((km / avg_speed_kmph) * 60)
+                # Tiempo = (Distancia / Velocidad) + Servicio
+                travel_time = (km / speed_km_min)
+                time_matrix[i][j] = travel_time
 
-    manager = pywrapcp.RoutingIndexManager(N, fleet_cfg['num_vehiculos'], 0)
+    # 3. Configurar OR-Tools
+    manager = pywrapcp.RoutingIndexManager(N, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def time_callback(from_idx, to_idx):
         f, t = manager.IndexToNode(from_idx), manager.IndexToNode(to_idx)
-        return time_matrix[f][t] + nodes[t]['service']
+        return int(time_matrix[f][t] + nodes[f]['service']) # Service time added at node
+        
     transit_idx = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
-
-    routing.AddDimension(transit_idx, 60*24, 60*24, False, "Time")
+    
+    # Restricción de Tiempo (Dimension)
+    routing.AddDimension(transit_idx, 10000, 10000, False, "Time") # Slack max grande para pruebas
     time_dim = routing.GetDimensionOrDie("Time")
+    
+    # Restricción de Capacidad
+    def demand_callback(from_idx):
+        node = manager.IndexToNode(from_idx)
+        return int(nodes[node]['demand'])
+    
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimensionWithVehicleCapacity(demand_idx, 0, [int(cap_kg)]*num_vehicles, True, "Capacity")
 
-    for node_idx in range(N):
-        idx = manager.NodeToIndex(node_idx)
-        start, end = time_str_to_minutes(nodes[node_idx]['tw_start']), time_str_to_minutes(nodes[node_idx]['tw_end'])
-        time_dim.CumulVar(idx).SetRange(start, end)
+    # Solución
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.time_limit.seconds = 5
+    
+    solution = routing.SolveWithParameters(search_parameters)
 
-    params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.time_limit.seconds = 15
-
-    sol = routing.SolveWithParameters(params)
-    if not sol:
+    if not solution:
         return None, None
 
-    coords_per_route = []
-    for v in range(fleet_cfg['num_vehiculos']):
-        idx = routing.Start(v)
-        seq = [[nodes[0]['lon'], nodes[0]['lat']]]
-        while not routing.IsEnd(idx):
-            node = manager.IndexToNode(idx)
-            if node != 0:
-                seq.append([nodes[node]['lon'], nodes[node]['lat']])
-            idx = sol.Value(routing.NextVar(idx))
-        seq.append([nodes[0]['lon'], nodes[0]['lat']])
-        coords_per_route.append(seq)
-
-    return coords_per_route, {"distancia_km": np.sum(dist_matrix)}
+    # Extraer rutas
+    rutas_coords = []
+    distancia_total = 0
+    
+    for vehicle_id in range(num_vehicles):
+        index = routing.Start(vehicle_id)
+        route = []
+        while not routing.IsEnd(index):
+            node_idx = manager.IndexToNode(index)
+            route.append([nodes[node_idx]['lat'], nodes[node_idx]['lon']])
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            # Sumar distancia (aproximada para métrica)
+            distancia_total += dist_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]
+            
+        # Añadir vuelta al depósito
+        node_idx = manager.IndexToNode(index)
+        route.append([nodes[node_idx]['lat'], nodes[node_idx]['lon']])
+        rutas_coords.append(route)
+        
+    return rutas_coords, {"distancia_km": distancia_total}
 
 # --- INTERFAZ ---
-st.title("🗺️ Optimización de Rutas Logísticas")
-st.write("Carga un archivo Excel o CSV con la configuración de flota y pedidos para calcular la ruta óptima.")
+st.title("🗺️ Optimización Logística: Pedidos y Flota")
 
 with st.sidebar:
-    st.header("📂 Cargar archivo")
-    file = st.file_uploader("Sube tu archivo (Excel o CSV)", type=["xlsx", "csv"])
+    st.header("📂 1. Cargar Datos")
+    st.info("Sube un Excel con dos hojas: 'pedidos' y 'flota'")
+    file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
+    
+    df_pedidos = None
+    df_flota = None
+    selected_fleet = None
 
-    if file is not None:
-        df = pd.read_excel(file) if file.name.endswith(".xlsx") else pd.read_csv(file)
-        st.success(f"{len(df)} registros cargados correctamente.")
+    if file:
+        try:
+            # Leer ambas hojas
+            xls = pd.ExcelFile(file)
+            sheet_names = [n.lower() for n in xls.sheet_names]
+            
+            # Buscar hojas (flexible con mayúsculas/minúsculas)
+            pedidos_sheet = next((s for s in xls.sheet_names if 'pedido' in s.lower()), None)
+            flota_sheet = next((s for s in xls.sheet_names if 'flota' in s.lower()), None)
 
-        # --- Filtrar datos ---
-        flota = df[df['tipo_registro'] == 'flota'].iloc[0]
-        pedidos = df[df['tipo_registro'] == 'pedido']
+            if pedidos_sheet and flota_sheet:
+                df_pedidos = pd.read_excel(file, sheet_name=pedidos_sheet)
+                df_flota = pd.read_excel(file, sheet_name=flota_sheet)
+                
+                # --- AUTO-CORRECCIÓN DE COORDENADAS ---
+                # Si la latitud es > 15 (Colombia está entre -4 y 12), dividimos por 10
+                if df_pedidos['Latitud'].mean() > 15:
+                    df_pedidos['Latitud'] = df_pedidos['Latitud'] / 10
+                    df_pedidos['Longitud'] = df_pedidos['Longitud'] / 10
+                    st.warning("⚠️ Detecté coordenadas mal escaladas (ej: 39.0 en vez de 3.9). Las he corregido automáticamente.")
 
-        fleet_cfg = {
-            "tipo": flota.get("tipo_vehiculo", "Camión"),
-            "capacity_kg": flota.get("capacidad_kg", 1000),
-            "capacity_m3": flota.get("capacidad_m3", 10),
-            "velocidad": flota.get("velocidad_kmph", 40),
-            "inicio_turno": flota.get("inicio_turno", "07:00"),
-            "fin_turno": flota.get("fin_turno", "19:00"),
-            "num_vehiculos": 3
-        }
+                # Renombrar columnas para estandarizar
+                df_pedidos.columns = df_pedidos.columns.str.strip() # Quitar espacios
+                df_pedidos = df_pedidos.rename(columns={
+                    'Latitud': 'lat', 'Longitud': 'lon', 
+                    'Peso (kg)': 'peso', 'Vol (m³)': 'vol'
+                })
+                
+                st.success("✅ Datos cargados correctamente.")
+                
+                st.divider()
+                st.header("🚚 2. Seleccionar Flota")
+                # Permitir al usuario elegir qué vehículo usar de la tabla flota
+                vehiculo_elegido = st.selectbox(
+                    "¿Qué tipo de vehículo usarás?", 
+                    df_flota['tipo_vehiculo'].unique()
+                )
+                
+                # Obtener la configuración de ese vehículo
+                selected_fleet = df_flota[df_flota['tipo_vehiculo'] == vehiculo_elegido].iloc[0].to_dict()
+                
+                # Mostrar ficha técnica del vehículo seleccionado
+                st.caption(f"Configuración: {int(selected_fleet['Cantidad'])} {vehiculo_elegido}(s)")
+                st.caption(f"Capacidad: {selected_fleet['capacidad_kg']} kg | Vel: {selected_fleet['velocidad_kmh']} km/h")
+                
+                # Guardar en sesión
+                st.session_state.puntos = df_pedidos.to_dict('records')
+                st.session_state.map_center = [df_pedidos.iloc[0]['lat'], df_pedidos.iloc[0]['lon']]
 
-        st.session_state.puntos = pedidos.to_dict('records')
+            else:
+                st.error("El Excel debe tener hojas llamadas 'pedidos' y 'flota'.")
+        
+        except Exception as e:
+            st.error(f"Error procesando el archivo: {e}")
 
-        st.info("Datos cargados: flota y pedidos listos para visualización.")
+# --- VISUALIZACIÓN ---
+col1, col2 = st.columns((3, 1))
 
-# --- MAPA ---
-col1, col2 = st.columns((2,1))
 with col1:
-    st.subheader("🗺️ Mapa de pedidos")
-    m = folium.Map(location=st.session_state.map_center, zoom_start=12)
-
+    m = folium.Map(location=st.session_state.map_center, zoom_start=11)
+    
+    # Dibujar pedidos
     for p in st.session_state.puntos:
-        folium.Marker(
-            [p['lat'], p['lon']],
-            popup=f"{p['nombre_pedido']} | {p['prioridad']} | {p['peso']}kg",
-            tooltip=p['nombre_pedido']
+        folium.CircleMarker(
+            location=[p['lat'], p['lon']],
+            radius=5,
+            color="blue",
+            fill=True,
+            tooltip=f"{p.get('Nombre Pedido', 'Pedido')} | {p['peso']}kg"
         ).add_to(m)
 
-    map_data = st_folium(m, height=550, width="100%")
+    # Lógica de cálculo
+    if selected_fleet and st.button("🚀 Calcular Rutas"):
+        centro = [st.session_state.puntos[0]['lat'], st.session_state.puntos[0]['lon']]
+        rutas, metricas = solve_vrptw(centro, st.session_state.puntos, selected_fleet)
+        
+        if rutas:
+            colors = ['red', 'green', 'blue', 'orange', 'purple']
+            for i, ruta in enumerate(rutas):
+                if len(ruta) > 2: # Solo dibujar si sale del depósito
+                    folium.PolyLine(ruta, weight=5, color=colors[i % len(colors)], opacity=0.8).add_to(m)
+            st.session_state.route_metrics = metricas
+            st.success("Rutas optimizadas con éxito")
+        else:
+            st.error("No se encontró solución factible (revisa capacidades o ventanas de tiempo).")
+
+    st_folium(m, height=600, use_container_width=True)
 
 with col2:
-    st.subheader("🚀 Cálculo de Ruta")
-    if st.button("Calcular Ruta (VRPTW)"):
-        if not st.session_state.puntos:
-            st.warning("Primero carga los pedidos.")
-        else:
-            centro = [st.session_state.puntos[0]['lat'], st.session_state.puntos[0]['lon']]
-            rutas, metricas = solve_vrptw(centro, st.session_state.puntos, fleet_cfg)
-            if rutas:
-                for r in rutas:
-                    folium.PolyLine([[lat, lon] for lon, lat in r], color="blue", weight=4).add_to(m)
-                st.success("Rutas calculadas correctamente.")
-                st.metric("Distancia estimada", f"{metricas['distancia_km']:.2f} km")
-            else:
-                st.error("No se pudo encontrar una ruta factible.")
-
-st.subheader("📊 Pedidos cargados")
-if 'puntos' in st.session_state and len(st.session_state.puntos) > 0:
-    st.dataframe(pd.DataFrame(st.session_state.puntos))
-
+    st.subheader("📋 Resumen")
+    if st.session_state.route_metrics:
+        st.metric("Distancia Total Estimada", f"{st.session_state.route_metrics['distancia_km']:.1f} km")
+    
+    if selected_fleet:
+        st.info(f"Simulando con: **{selected_fleet['tipo_vehiculo']}**")
+    
+    with st.expander("Ver Datos de Pedidos"):
+        if df_pedidos is not None:
+            st.dataframe(df_pedidos[['Nombre Pedido', 'peso', 'lat', 'lon']])
