@@ -13,7 +13,3 @@ pyproj
 shapely
 requests
 openpyxl
-
-
-
-
