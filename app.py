@@ -3,412 +3,301 @@ import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-from math import radians, cos, sin, asin, sqrt
+from math import radians, cos, sin, asin, sqrt, ceil
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-import datetime
 
-# --- CONFIGURACIÓN DE PÁGINA ---
+# --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Panel de Control de Rutas", page_icon="🚚", layout="wide")
 
 # --- ESTADO INICIAL ---
 if 'puntos' not in st.session_state: st.session_state.puntos = []
 if 'map_center' not in st.session_state: st.session_state.map_center = [3.900, -76.300]
 if 'route_metrics' not in st.session_state: st.session_state.route_metrics = None
-if 'cedis' not in st.session_state: st.session_state.cedis = {'lat': 3.900, 'lon': -76.300, 'nombre': 'CEDIS Inicial (Buga)'}
-if 'df_pedidos' not in st.session_state: st.session_state.df_pedidos = None
-if 'df_flota' not in st.session_state: st.session_state.df_flota = None
-if 'last_calculated_cedis' not in st.session_state: st.session_state.last_calculated_cedis = st.session_state.cedis.copy()
-
-
-# Colores predefinidos para las rutas
-ROUTE_COLORS = ['#E41A1C', '#377EB8', '#4DAF4A', '#984EA3', '#FF7F00', '#FFFF33', '#A65628', '#F781BF', '#999999', '#66C2A5']
+if 'cedis' not in st.session_state: st.session_state.cedis = []  # lista de dicts {'lat':..., 'lon':..., 'nombre':...}
 
 # --- FUNCIONES AUXILIARES ---
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Calcula la distancia Haversine (geodésica/línea recta) en km."""
+    """Distancia Haversine en km."""
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlon, dlat = lon2 - lon1, lat2 - lat1
     a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
     return 6371 * 2 * asin(sqrt(a))
 
-def format_time_series(series, default_time):
-    """Convierte todos los valores de una serie a un string 'HH:MM' de forma segura."""
-    series = series.fillna(default_time).copy()
-    
-    def safe_format(val):
-        if isinstance(val, str) and len(val) == 5 and val.count(':') == 1:
-            return val
-        try:
-            dt = pd.to_datetime(val, errors='coerce')
-            if pd.notna(dt):
-                return dt.strftime('%H:%M')
-        except:
-            pass 
-            
-        return default_time
-
-    return series.apply(safe_format)
-
 def time_str_to_minutes(t):
-    """Convierte un objeto de tiempo o una cadena de texto a minutos desde la medianoche, garantizando un int de Python."""
-    
-    if isinstance(t, pd.Timestamp):
-        t = t.time()
-        
-    if isinstance(t, datetime.time):
-        return int(t.hour * 60 + t.minute) # Conversión a int() nativo
-        
     if isinstance(t, str):
         try:
-            parts = t.split(':')
-            h = int(parts[0])
-            m = int(parts[1]) if len(parts) > 1 else 0
-            return int(h * 60 + m) # Conversión a int() nativo
-        except: 
-            return 420 
-    
+            h, m = map(int, t.split(':'))
+            return h*60 + m
+        except:
+            return 420
     return 420
 
-def solve_vrptw(centro, puntos, df_flota):
-    """
-    Resuelve el VRPTW utilizando la flota completa disponible. 
-    """
-    
-    # 1. Crear Pool de Vehículos
-    vehicle_pool = []
-    vehicle_capacities = []
-    vehicle_speeds = []
-    
-    if df_flota.empty: return None, None
-    
-    depot_start_time = df_flota.iloc[0]['turno_inicio']
-    depot_end_time = df_flota.iloc[0]['turno_fin']
-    
-    for idx, row in df_flota.iterrows():
-        for i in range(int(row['cantidad'])):
-            vehicle_pool.append({
-                'type': row['tipo_vehiculo'],
-                'capacity_kg': float(row['capacidad_kg']),
-                'speed_kmph': float(row['velocidad_kmh']),
-            })
-            vehicle_capacities.append(int(row['capacidad_kg']))
-            vehicle_speeds.append(float(row['velocidad_kmh']))
-    
-    num_vehicles = len(vehicle_pool)
-    if num_vehicles == 0: 
-        st.error("No hay vehículos disponibles en la flota.")
+def solve_vrptw(centro, puntos, fleet_cfg, num_vehicles_override=None):
+    """Resuelve VRPTW con OR-Tools (usando distancias Haversine).
+    Si num_vehicles_override se pasa, se usa ese número de vehículos."""
+    # Validar config flota
+    try:
+        num_vehicles = int(fleet_cfg.get('cantidad', 1))
+        cap_kg = float(fleet_cfg.get('capacidad_kg', 1000))
+        speed_kmh = float(fleet_cfg.get('velocidad_kmh', 40))
+        speed_km_min = speed_kmh / 60.0
+    except Exception as e:
+        st.error(f"Error en la configuración de la flota: {e}")
         return None, None
-    
-    avg_speed_km_min = np.mean(vehicle_speeds) / 60.0 if vehicle_speeds else 1.0
-    
-    # 2. Crear Nodos
-    nodes = [{'lat': centro['lat'], 'lon': centro['lon'], 'demand': 0, 'service': 0, 
-              'tw_start': depot_start_time, 'tw_end': depot_end_time}]
-    
+
+    if num_vehicles_override:
+        num_vehicles = int(num_vehicles_override)
+
+    # Construir nodos (0 = depósito)
+    nodes = [{'lat': centro[0], 'lon': centro[1], 'demand': 0, 'service': 0,
+              'tw_start': fleet_cfg.get('turno_inicio', '07:00'),
+              'tw_end': fleet_cfg.get('turno_fin', '19:00')}]
     for p in puntos:
         nodes.append({
-            'lat': p['lat'], 'lon': p['lon'], 'demand': p['peso'], 'service': 15,
-            'tw_start': p.get('Tw_Start', '07:00'), 
-            'tw_end': p.get('Tw_End', '19:00')
+            'lat': p['lat'], 'lon': p['lon'], 'demand': p.get('peso', 0), 'service': int(p.get('service', 15)),
+            'tw_start': str(p.get('Tw_Start', '07:00')), 'tw_end': str(p.get('Tw_End', '19:00'))
         })
+
     N = len(nodes)
-    
-    # 3. Matrices de Distancia y Tiempo
+    # Matrices
     dist_matrix = np.zeros((N, N))
     time_matrix = np.zeros((N, N))
-    
     for i in range(N):
         for j in range(N):
             if i != j:
                 km = haversine_km(nodes[i]['lat'], nodes[i]['lon'], nodes[j]['lat'], nodes[j]['lon'])
                 dist_matrix[i][j] = km
-                time_matrix[i][j] = (km / avg_speed_km_min)
+                time_matrix[i][j] = (km / speed_km_min)
+            # sumar servicio al destino
             time_matrix[i][j] += nodes[j]['service']
 
-    # 4. Configurar OR-Tools
+    # OR-Tools
     manager = pywrapcp.RoutingIndexManager(N, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def time_callback(from_idx, to_idx):
         f, t = manager.IndexToNode(from_idx), manager.IndexToNode(to_idx)
         return int(time_matrix[f][t])
-        
+
     transit_idx = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
-    
-    # Dimensión de Tiempo
-    max_time = int(time_str_to_minutes(depot_end_time) + 60)
-    routing.AddDimension(transit_idx, max_time, max_time, True, "Time")
+
+    # Time dimension
+    max_time = int(time_str_to_minutes(fleet_cfg.get('turno_fin', '19:00')) + 60)
+    routing.AddDimension(transit_idx, max_time, max_time, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
-    
-    # Establecer rangos de tiempo (Time Windows)
+
     for node_idx in range(N):
-        # *** REFUERZO DE TIPO INT ANTES DE SetRange ***
-        start = int(time_str_to_minutes(nodes[node_idx]['tw_start']))
-        end = int(time_str_to_minutes(nodes[node_idx]['tw_end']))
         idx = manager.NodeToIndex(node_idx)
-        
-        # Validación de rangos
-        if start >= end:
-            end = start + 60 
-            
+        start = time_str_to_minutes(nodes[node_idx]['tw_start'])
+        end = time_str_to_minutes(nodes[node_idx]['tw_end'])
         time_dim.CumulVar(idx).SetRange(start, end)
-        
-    # Dimensión de Capacidad (Peso)
+
+    # Capacity dimension
     def demand_callback(from_idx):
         node = manager.IndexToNode(from_idx)
         return int(nodes[node]['demand'])
-    
-    demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
-    
-    routing.AddDimensionWithVehicleCapacity(demand_idx, 
-                                            0, 
-                                            vehicle_capacities,
-                                            True, 
-                                            "Capacity")
-    
-    # Penalidad alta por no entregar
-    for node_idx in range(1, N): 
-        routing.AddDisjunction([manager.NodeToIndex(node_idx)], 1000000)
 
-    # 5. Solución
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimensionWithVehicleCapacity(demand_idx, 0, [int(cap_kg)]*num_vehicles, True, "Capacity")
+
+    # Buscar solución
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_parameters.time_limit.seconds = 5
-    
+    search_parameters.time_limit.seconds = 10
     solution = routing.SolveWithParameters(search_parameters)
+    if not solution:
+        return None, None
 
-    if not solution: return None, None
-
-    # 6. Extracción de resultados
-    rutas_info = []
-    distancia_total = 0
+    rutas_coords = []
+    distancia_total = 0.0
     vehiculos_usados = []
-    
     for vehicle_id in range(num_vehicles):
         index = routing.Start(vehicle_id)
-        route_coords = []
-        route_served = False
-        
+        route = [[nodes[0]['lat'], nodes[0]['lon']]]  # inicio en depósito
+        used = False
+        prev_node = manager.IndexToNode(index)
         while not routing.IsEnd(index):
             node_idx = manager.IndexToNode(index)
-            
+            # si no es depósito y no repetido, agregar
             if node_idx != 0:
-                route_coords.append([nodes[node_idx]['lat'], nodes[node_idx]['lon']])
-                route_served = True
-
+                route.append([nodes[node_idx]['lat'], nodes[node_idx]['lon']])
+                used = True
             previous_index = index
             index = solution.Value(routing.NextVar(index))
-            
-            if previous_index != index:
-                 distancia_total += dist_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]
-        
-        if route_served:
-            route_coords.insert(0, [centro['lat'], centro['lon']])
-            route_coords.append([centro['lat'], centro['lon']])
-            
-            vehiculos_usados.append(vehicle_pool[vehicle_id]['type'])
-            rutas_info.append({
-                'coords': route_coords,
-                'vehicle_type': vehicle_pool[vehicle_id]['type'],
-                'vehicle_id': vehicle_id + 1
-            })
-            
-    return rutas_info, {"distancia_km": distancia_total, "vehiculos_usados": vehiculos_usados}
+            # sumar distancia entre previous->current
+            curr_node = manager.IndexToNode(index)
+            distancia_total += dist_matrix[manager.IndexToNode(previous_index)][curr_node]
+        route.append([nodes[0]['lat'], nodes[0]['lon']])
+        if used:
+            rutas_coords.append(route)
+            vehiculos_usados.append(f"{vehicle_id+1}")
+    metrics = {
+        "distancia_km": distancia_total,
+        "vehiculos_usados": vehiculos_usados,
+        "num_vehiculos_usados": len(vehiculos_usados)
+    }
+    return rutas_coords, metrics
 
 # --- INTERFAZ ---
-st.title("🗺️ Optimización Logística: Pedidos y Flota")
+st.title("🗺️ Optimización Logística: Pedidos y Flota (Con CEDIS por Coordenadas)")
 
-col1, col2 = st.columns((3, 1))
-
+# SIDEBAR: Cargar datos + CEDIS + Costos
 with st.sidebar:
     st.header("📂 1. Cargar Datos")
-    st.info("Sube el archivo **Excel (.xlsx)** con hojas 'pedidos' y 'flota'. Las rutas se calcularán automáticamente.")
+    st.info("Sube un Excel con hojas: 'pedidos' y 'flota' (o nombres que contengan 'pedido' y 'flota').")
     file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"])
-    
+
+    # Slider costo por km
+    costo_km = st.slider("Costo por kilómetro (moneda local)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+
+    st.divider()
+    st.header("🏬 2. CEDIS (por coordenadas)")
+    cedi_lat = st.number_input("Latitud CEDI", value=3.9, format="%.6f")
+    cedi_lon = st.number_input("Longitud CEDI", value=-76.3, format="%.6f")
+    cedi_nombre = st.text_input("Nombre CEDI (opcional)", value=f"CEDI {len(st.session_state.cedis)+1}")
+    if st.button("➕ Agregar CEDI"):
+        st.session_state.cedis.append({'lat': float(cedi_lat), 'lon': float(cedi_lon), 'nombre': cedi_nombre})
+        st.success(f"CEDI '{cedi_nombre}' agregado.")
+
+    if st.session_state.cedis:
+        nombres = [f"{i+1} - {c['nombre']}" for i,c in enumerate(st.session_state.cedis)]
+        seleccion_cedi_idx = st.selectbox("Selecciona CEDI activo", options=list(range(len(st.session_state.cedis))), format_func=lambda x: nombres[x])
+    else:
+        seleccion_cedi_idx = None
+
+    st.divider()
+    st.header("📦 3. Parámetros flota")
+    # Cargar datos de flota tras subir fichero
+    df_pedidos = None
+    df_flota = None
+    selected_fleet = None
     if file:
         try:
             xls = pd.ExcelFile(file)
             pedidos_sheet = next((s for s in xls.sheet_names if 'pedido' in s.lower()), None)
             flota_sheet = next((s for s in xls.sheet_names if 'flota' in s.lower()), None)
-
             if pedidos_sheet and flota_sheet:
-                df_pedidos_loaded = pd.read_excel(file, sheet_name=pedidos_sheet)
-                df_flota_loaded = pd.read_excel(file, sheet_name=flota_sheet)
-                
-                # --- Preprocesamiento de PEDIDOS ---
-                df_pedidos_loaded.columns = df_pedidos_loaded.columns.str.strip() 
-                df_pedidos_loaded = df_pedidos_loaded.rename(columns={
-                    'Latitud': 'lat', 'Longitud': 'lon', 'Peso (kg)': 'peso', 'Vol (m³)': 'vol',
-                    'Nombre Pedido': 'nombre_pedido' 
-                })
-                if 'nombre_pedido' not in df_pedidos_loaded.columns:
-                    df_pedidos_loaded['nombre_pedido'] = 'Pedido ' + df_pedidos_loaded.index.astype(str)
-
-                # CORRECCIÓN DE ESCALA: Se mantiene el ajuste por el formato de las coordenadas
-                if 'lat' in df_pedidos_loaded.columns and df_pedidos_loaded['lat'].mean() > 15:
-                    df_pedidos_loaded['lat'] = df_pedidos_loaded['lat'] / 10
-                    df_pedidos_loaded['lon'] = df_pedidos_loaded['lon'] / 10
-                    st.warning("⚠️ Coordenadas corregidas (división por 10).")
-                
-                # LIMPIEZA DE TIEMPOS DE PEDIDOS (Usando las columnas Tw_Start/Tw_End del Excel)
-                df_pedidos_loaded['Tw_Start'] = df_pedidos_loaded.get('Tw_Start', pd.Series(['07:00']))
-                df_pedidos_loaded['Tw_End'] = df_pedidos_loaded.get('Tw_End', pd.Series(['19:00']))
-                df_pedidos_loaded['Tw_Start'] = format_time_series(df_pedidos_loaded['Tw_Start'], '07:00')
-                df_pedidos_loaded['Tw_End'] = format_time_series(df_pedidos_loaded['Tw_End'], '19:00')
-
-
-                # --- Preprocesamiento de FLOTA ---
-                df_flota_loaded.columns = df_flota_loaded.columns.str.strip().str.lower()
-                df_flota_loaded['cantidad'] = df_flota_loaded['cantidad'].fillna(0).astype(int)
-                df_flota_loaded['capacidad_kg'] = df_flota_loaded['capacidad_kg'].fillna(0).astype(float)
-                df_flota_loaded['velocidad_kmh'] = df_flota_loaded['velocidad_kmh'].fillna(40).astype(float)
-                
-                # --- CORRECCIÓN CRÍTICA: Lógica para columna 'turno' (duración) ---
-                df_flota_loaded['turno_inicio'] = df_flota_loaded.get('turno_inicio', pd.Series(dtype='object'))
-                df_flota_loaded['turno_fin'] = df_flota_loaded.get('turno_fin', pd.Series(dtype='object'))
-
-                if 'turno' in df_flota_loaded.columns and df_flota_loaded['turno_inicio'].isnull().all():
-                    st.info("⚠️ Usando la columna 'turno' (horas) para calcular la ventana de tiempo de los vehículos (Inicio 07:00).")
-                    df_flota_loaded['turno'] = df_flota_loaded['turno'].fillna(8).astype(int)
-                    df_flota_loaded['turno_inicio'] = '07:00'
-                    
-                    def calculate_end_time(duration_hours):
-                        start_time = datetime.datetime.strptime('07:00', '%H:%M')
-                        end_time = start_time + datetime.timedelta(hours=int(duration_hours))
-                        return end_time.strftime('%H:%M')
-                        
-                    df_flota_loaded['turno_fin'] = df_flota_loaded['turno'].apply(calculate_end_time)
-
-                # Aplicar default y formateo estricto
-                df_flota_loaded['turno_inicio'] = df_flota_loaded['turno_inicio'].fillna('07:00')
-                df_flota_loaded['turno_fin'] = df_flota_loaded['turno_fin'].fillna('19:00')
-                df_flota_loaded['turno_inicio'] = format_time_series(df_flota_loaded['turno_inicio'], '07:00')
-                df_flota_loaded['turno_fin'] = format_time_series(df_flota_loaded['turno_fin'], '19:00')
-
-
-                # Guardar en estado de sesión
-                st.session_state.df_pedidos = df_pedidos_loaded
-                st.session_state.df_flota = df_flota_loaded
-                st.session_state.puntos = st.session_state.df_pedidos.to_dict('records')
-                
-                st.session_state.route_metrics = None 
-                st.success("✅ Datos cargados. Calculando rutas automáticamente...")
-
+                df_pedidos = pd.read_excel(file, sheet_name=pedidos_sheet)
+                df_flota = pd.read_excel(file, sheet_name=flota_sheet)
+                # normalizar nombres columnas
+                df_pedidos.columns = df_pedidos.columns.str.strip()
+                df_pedidos = df_pedidos.rename(columns={'Latitud':'lat', 'Longitud':'lon', 'Peso (kg)':'peso', 'Peso':'peso'})
+                if 'lat' in df_pedidos.columns and df_pedidos['lat'].mean() > 15:
+                    df_pedidos['lat'] = df_pedidos['lat'] / 10
+                    df_pedidos['lon'] = df_pedidos['lon'] / 10
+                    st.warning("Detecté coordenadas mal escaladas y las corregí dividiendo por 10.")
+                df_flota.columns = df_flota.columns.str.strip().str.lower()
+                st.success("✅ Datos cargados correctamente.")
+                # select vehiculo
+                if 'tipo_vehiculo' in df_flota.columns:
+                    vehiculo_elegido = st.selectbox("Tipo de vehículo", df_flota['tipo_vehiculo'].unique())
+                    selected_fleet_series = df_flota[df_flota['tipo_vehiculo'] == vehiculo_elegido].iloc[0]
+                    selected_fleet = selected_fleet_series.to_dict()
+                    # asegurar claves
+                    selected_fleet.setdefault('cantidad', int(selected_fleet.get('cantidad', 1)))
+                    selected_fleet.setdefault('capacidad_kg', float(selected_fleet.get('capacidad_kg', 1000)))
+                    selected_fleet.setdefault('velocidad_kmh', float(selected_fleet.get('velocidad_kmh', 40)))
+                    selected_fleet.setdefault('turno_inicio', selected_fleet.get('turno_inicio', '07:00'))
+                    selected_fleet.setdefault('turno_fin', selected_fleet.get('turno_fin', '19:00'))
+                    st.caption(f"Configuración: {int(selected_fleet.get('cantidad',1))} x {vehiculo_elegido} (cap {selected_fleet.get('capacidad_kg')} kg)")
+                    # guardar pedidos en sesión para visualizar en mapa
+                    st.session_state.puntos = df_pedidos.to_dict('records')
+                    if 'lat' in df_pedidos.columns:
+                        st.session_state.map_center = [df_pedidos.iloc[0]['lat'], df_pedidos.iloc[0]['lon']]
+                else:
+                    st.error("La hoja de flota debe contener la columna 'tipo_vehiculo'.")
             else:
-                st.error("El Excel debe tener hojas llamadas 'pedidos' y 'flota'.")
-        
+                st.error("El Excel debe tener hojas con 'pedidos' y 'flota' en su nombre.")
         except Exception as e:
-            st.error(f"Error procesando el archivo. Asegúrese que las coordenadas y pesos son numéricos: {e}")
-            
-    # --- 2. Ingreso Manual del CEDIS ---
-    st.divider()
-    st.header("📍 2. Ubicación del CEDIS")
-    col_lat, col_lon = st.columns(2)
-    
-    cedis_lat = col_lat.number_input("Latitud CEDIS", value=st.session_state.cedis['lat'], format="%.4f")
-    cedis_lon = col_lon.number_input("Longitud CEDIS", value=st.session_state.cedis['lon'], format="%.4f")
-    st.session_state.cedis = {'lat': cedis_lat, 'lon': cedis_lon, 'nombre': 'CEDIS Personalizado'}
-    
-    # --- 3. Costos y Cálculo ---
-    st.divider()
-    st.header("💰 3. Costo Operacional")
-    
-    costo_por_km = st.slider(
-        "Costo Operacional por Kilómetro ($/km)", 
-        min_value=500.0, max_value=5000.0, value=2500.0, step=100.0, format="$ %.0f"
-    )
+            st.error(f"Error procesando archivo: {e}")
+    else:
+        st.info("Sube un Excel para habilitar la selección de flota y pedidos.")
 
+# --- VISUALIZACIÓN PRINCIPAL ---
+col1, col2 = st.columns((3,1))
 with col1:
-    st.subheader("🗺️ Visualización de Rutas")
-    
-    m = folium.Map(location=[st.session_state.cedis['lat'], st.session_state.cedis['lon']], zoom_start=11)
-    
-    folium.Marker(
-        location=[st.session_state.cedis['lat'], st.session_state.cedis['lon']],
-        popup=st.session_state.cedis['nombre'],
-        icon=folium.Icon(color='green', icon='warehouse', prefix='fa')
-    ).add_to(m)
-    
+    m = folium.Map(location=st.session_state.map_center, zoom_start=11)
+    # dibujar cedis en mapa
+    for i, c in enumerate(st.session_state.cedis):
+        folium.Marker(location=[c['lat'], c['lon']], tooltip=f"CEDI {i+1}: {c['nombre']}",
+                      icon=folium.Icon(color='darkgreen', icon='warehouse')).add_to(m)
+    # dibujar pedidos
     for p in st.session_state.puntos:
-        folium.CircleMarker(
-            location=[p['lat'], p['lon']],
-            radius=5,
-            color="blue",
-            fill=True,
-            tooltip=f"{p.get('nombre_pedido', 'Pedido')} | {p['peso']}kg"
-        ).add_to(m)
+        folium.CircleMarker(location=[p['lat'], p['lon']], radius=5, color="blue", fill=True,
+                            tooltip=f"{p.get('Nombre Pedido', p.get('nombre','Pedido'))} | {p.get('peso',0)}kg").add_to(m)
 
-    if st.session_state.route_metrics and st.session_state.route_metrics.get('rutas_info'):
-        for i, ruta_info in enumerate(st.session_state.route_metrics['rutas_info']):
-            folium.PolyLine(
-                ruta_info['coords'], 
-                weight=5, 
-                color=ROUTE_COLORS[i % len(ROUTE_COLORS)], 
-                opacity=0.8,
-                tooltip=f"Ruta {ruta_info['vehicle_id']} ({ruta_info['vehicle_type']})"
-            ).add_to(m)
+    # graficar lineas rectas CEDI->pedidos (si hay CEDI seleccionado)
+    if seleccion_cedi_idx is not None and st.session_state.cedis:
+        cedi_act = st.session_state.cedis[seleccion_cedi_idx]
+        for p in st.session_state.puntos:
+            folium.PolyLine([[cedi_act['lat'], cedi_act['lon']], [p['lat'], p['lon']]],
+                            color='gray', weight=1.5, dash_array='5').add_to(m)
 
-    st_folium(m, height=600, use_container_width=True)
+    # botón calcular rutas
+    if selected_fleet and st.button("🚀 Calcular Rutas & Costos"):
+        # seleccionar centro (CEDI activo) o fallback al primer punto
+        if seleccion_cedi_idx is not None and st.session_state.cedis:
+            centro = [st.session_state.cedis[seleccion_cedi_idx]['lat'], st.session_state.cedis[seleccion_cedi_idx]['lon']]
+        else:
+            centro = [st.session_state.puntos[0]['lat'], st.session_state.puntos[0]['lon']]
+
+        # calcular número mínimo de vehículos necesarios según demanda total y capacidad
+        total_demand = sum([float(p.get('peso', 0) or 0) for p in st.session_state.puntos])
+        cap_kg = float(selected_fleet.get('capacidad_kg', 1000))
+        num_necesarios = max(1, ceil(total_demand / cap_kg))
+        # limitar a la cantidad disponible en la hoja si aparece 'cantidad'
+        cantidad_disponible = int(selected_fleet.get('cantidad', num_necesarios))
+        num_vehicles_to_use = min(cantidad_disponible, max(cantidad_disponible, num_necesarios))  # si queremos usar tantos como sean necesarios, aquí simplificamos: usamos num_necesarios pero no menos que 1
+        # para permitir usar más vehículos que la hoja indica (si se desea), podrías cambiar la lógica. Aquí usamos num_necesarios.
+        num_vehicles_to_use = num_necesarios
+
+        rutas, metricas = solve_vrptw(centro, st.session_state.puntos, selected_fleet, num_vehicles_override=num_vehicles_to_use)
+        if rutas:
+            colors = ['red','green','blue','orange','purple','black','cadetblue','darkred']
+            for i, ruta in enumerate(rutas):
+                if len(ruta) > 1:
+                    folium.PolyLine(ruta, weight=4, color=colors[i % len(colors)], opacity=0.8,
+                                    tooltip=f"Ruta {i+1}").add_to(m)
+            st.session_state.route_metrics = metricas
+            # calcular costo
+            costo_total = metricas['distancia_km'] * costo_km
+            st.success("Rutas optimizadas con éxito.")
+            st.info(f"Se usaron {metricas['num_vehiculos_usados']} vehículo(s). Distancia estimada: {metricas['distancia_km']:.2f} km. Costo estimado: {costo_total:.2f}")
+        else:
+            st.session_state.route_metrics = None
+            st.error("No se encontró solución factible. Revisa capacidades, ventanas de tiempo o datos de pedidos.")
+
+    st_folium(m, height=650, use_container_width=True)
 
 with col2:
-    st.subheader("🚀 Cálculo y Resultados")
-    
-    # --- LÓGICA DE AUTO-CÁLCULO ---
-    if st.session_state.df_pedidos is not None and st.session_state.df_flota is not None:
-        
-        cedis_changed = (st.session_state.cedis['lat'] != st.session_state.last_calculated_cedis['lat'] or
-                         st.session_state.cedis['lon'] != st.session_state.last_calculated_cedis['lon'])
-
-        if st.session_state.route_metrics is None or cedis_changed:
-            
-            with st.spinner("Calculando asignación de flota y rutas automáticamente..."):
-                rutas_info, metricas = solve_vrptw(st.session_state.cedis, st.session_state.puntos, st.session_state.df_flota)
-            
-            if rutas_info:
-                st.session_state.route_metrics = {
-                    'distancia_km': metricas['distancia_km'],
-                    'costo_por_km': costo_por_km, 
-                    'rutas_info': rutas_info,
-                    'vehiculos_usados': metricas['vehiculos_usados']
-                }
-                st.session_state['last_calculated_cedis'] = st.session_state.cedis.copy()
-                st.success(f"Cálculo finalizado. {len(rutas_info)} vehículos utilizados.")
-                st.balloons()
-            else:
-                st.session_state.route_metrics = None
-                st.error("No se encontró solución factible. Revisa la flota o las ventanas de tiempo.")
-
-        elif st.session_state.route_metrics and st.session_state.route_metrics['costo_por_km'] != costo_por_km:
-            st.session_state.route_metrics['costo_por_km'] = costo_por_km
-            st.info("Costo operacional actualizado automáticamente.") 
-
-    st.divider()
-    
-    # --- RESULTADOS ---
-    if st.session_state.route_metrics: 
-        distancia = st.session_state.route_metrics['distancia_km']
-        costo_total = distancia * st.session_state.route_metrics['costo_por_km']
-        num_rutas = len(st.session_state.route_metrics['rutas_info'])
-        
-        st.metric("Distancia Total Estimada", f"{distancia:,.1f} km", delta=f"{num_rutas} Rutas")
-        st.metric("Costo Operacional Total", f"$ {costo_total:,.0f} COP")
-        
-        st.subheader("Flota Asignada")
-        
-        df_usados = pd.Series(st.session_state.route_metrics['vehiculos_usados']).value_counts().reset_index()
-        df_usados.columns = ['Tipo de Vehículo', 'Cantidad Utilizada']
-        st.dataframe(df_usados, hide_index=True)
-        
-    st.divider()
-    
-    # --- TABLA DE PEDIDOS CARGADOS ---
-    st.subheader("📦 Pedidos Cargados")
-    if st.session_state.df_pedidos is not None:
-        st.dataframe(
-            st.session_state.df_pedidos[['nombre_pedido', 'peso', 'lat', 'lon', 'Tw_Start', 'Tw_End', 'Ciudad']],
-            use_container_width=True,
-            hide_index=True
-        )
+    st.subheader("📋 Resumen / Métricas")
+    if st.session_state.route_metrics:
+        dist = st.session_state.route_metrics['distancia_km']
+        st.metric("Distancia Total Estimada", f"{dist:.1f} km")
+        costo_total = dist * costo_km
+        st.metric("Costo Estimado (km)", f"{costo_total:.2f}")
+        st.write("Vehículos usados (IDs):", ", ".join(st.session_state.route_metrics.get('vehiculos_usados', [])))
+        st.write("Número de vehículos usados:", st.session_state.route_metrics.get('num_vehiculos_usados', 0))
     else:
-        st.info("Cargue su archivo Excel para ver la lista de pedidos.")
+        st.info("Aún no hay rutas calculadas.")
+
+    if selected_fleet:
+        st.markdown("**Configuración flota seleccionada:**")
+        st.write(selected_fleet)
+
+    with st.expander("Ver Pedidos Cargados (tabla)"):
+        if df_pedidos is not None:
+            st.dataframe(df_pedidos)
+        else:
+            st.write("No hay pedidos cargados desde Excel.")
+
+    with st.expander("CEDIS registrados"):
+        if st.session_state.cedis:
+            df_cedis = pd.DataFrame(st.session_state.cedis)
+            st.dataframe(df_cedis)
+        else:
+            st.write("No hay CEDIS registrados.")
+
+    st.caption("Notas: La distancia se calcula en línea recta (Haversine). El modelo intenta respetar ventanas de tiempo y capacidades. Ajusta capacidad/velocidad en la hoja 'flota' si necesitas precisión realista.")
+
