@@ -6,25 +6,16 @@ from streamlit_folium import st_folium
 from math import radians, cos, sin, asin, sqrt, ceil
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-###################################################################################################################3
-# CONFIGURACIÓN
-###################################################################################################################3
-
+# --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Panel de Control de Rutas", page_icon="🚚", layout="wide")
 
-###################################################################################################################3
-#ESTADO INICIAL
-###################################################################################################################3
-
+# --- ESTADO INICIAL ---
 if 'puntos' not in st.session_state: st.session_state.puntos = []
 if 'map_center' not in st.session_state: st.session_state.map_center = [3.900, -76.300]
 if 'route_metrics' not in st.session_state: st.session_state.route_metrics = None
-if 'cedis' not in st.session_state: st.session_state.cedis = []  
-    
-###################################################################################################################3
-#FUNCIONES AUXILIARES
-###################################################################################################################3
+if 'cedis' not in st.session_state: st.session_state.cedis = []  # lista de dicts {'lat':..., 'lon':..., 'nombre':...}
 
+# --- FUNCIONES AUXILIARES ---
 def haversine_km(lat1, lon1, lat2, lon2):
     """Distancia Haversine en km."""
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
@@ -149,12 +140,10 @@ def solve_vrptw(centro, puntos, fleet_cfg, num_vehicles_override=None):
         "num_vehiculos_usados": len(vehiculos_usados),
         "distancias_por_ruta": distancias_rutas
     }
-    return rutas_coords, metrics
-    
-###################################################################################################################3
-#INTERFAZ
-###################################################################################################################3
 
+    return rutas_coords, metrics
+
+# --- INTERFAZ ---
 st.title("🗺️ Optimización Logística: Pedidos y Flota (Con CEDIS por Coordenadas)")
 
 with st.sidebar:
@@ -282,11 +271,8 @@ with col1:
                         ruta, weight=4, color=colors[i % len(colors)], opacity=0.8,
                         tooltip=f"Ruta {i+1}"
                     ).add_to(m)
-                    
-###################################################################################################################
-#LEYENDA DE GRAFICOS
-###################################################################################################################
 
+            # ------ LEYENDA NUEVA ------
             legend_html = """
             <div style="
                 position: fixed;
@@ -314,7 +300,8 @@ with col1:
 
             legend_html += "</div>"
             m.get_root().html.add_child(folium.Element(legend_html))
-            
+            # -----------------------------------
+
             st.session_state.route_metrics = metricas
             costo_total = metricas['distancia_km'] * costo_km
 
